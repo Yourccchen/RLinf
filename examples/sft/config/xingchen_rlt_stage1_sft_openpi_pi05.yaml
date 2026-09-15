@@ -1,0 +1,129 @@
+defaults:
+  - model/pi0_5_rlinf@actor.model
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: all
+
+runner:
+  task_type: sft
+  logger:
+    # Absolute path: the job's cwd differs from the devbox, and this lands on
+    # shared storage so results survive the pod.
+    log_path: "/mnt/vepfs/world/caimengchen/rlinf_runs"
+    project_name: rlinf-rlt
+    experiment_name: "xingchen_rlt_stage1_sft_openpi_pi05"
+    # tensorboard alongside wandb so metrics are kept locally even if the
+    # wandb upload fails on the cluster.
+    logger_backends: ["wandb", "tensorboard"]
+
+  max_epochs: -1
+  max_steps: 2000
+  val_check_interval: -1
+  save_interval: 250
+
+data:
+  # S3 prefix for ARIO-format episodes (read directly, no LeRobot conversion needed)
+  s3_prefixes: "s3://shengshu-world-model-data/ARIO-new/songling/叠黑色T恤/"
+  s3_endpoint: "https://oss-cn-wulanchabu-internal.aliyuncs.com"
+  # Temporal downsampling: 30fps raw -> 5fps training samples
+  video_downsample_rate: 6
+  # Skip episodes shorter than this many raw frames (~63s at 30fps)
+  min_frames: 100
+  num_workers: 4
+  # Decoded-episode cache on shared storage (pod /tmp is too small for this).
+  disk_cache_dir: "/mnt/vepfs/world/caimengchen/ario_disk_cache"
+  disk_cache_max_gb: 200.0
+  # Uncomment to smoke-test the pipeline on a handful of episodes first:
+  # max_episodes: 4
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  # Full node = 8 GPUs (the embody pool has no partially-free nodes, so a
+  # 1-GPU request cannot be admitted). grad_accum = global / micro / 8 = 8.
+  micro_batch_size: 1
+  global_batch_size: 64
+  seed: 0
+
+  model:
+    precision: fp32
+    model_path: "/mnt/vepfs/world/caimengchen/models/pi05_base"
+    model_type: "openpi_rlinf"
+    num_action_chunks: 10
+    action_dim: 31
+    add_value_head: False
+    num_steps: 5
+    openpi:
+      task: sft
+      config_name: "pi05_rlt_xingchen_joint"
+      num_images_in_input: 3          # cam_high + left_wrist + right_wrist
+      train_expert_only: False
+      detach_critic_input: True
+      action_horizon: 10
+      action_chunk: ${actor.model.num_action_chunks}
+      action_env_dim: ${actor.model.action_dim}
+      num_steps: ${actor.model.num_steps}
+      model_action_dim: 32
+      paligemma_variant: "gemma_2b"
+      action_expert_variant: "gemma_300m"
+      max_token_len: 200
+      discrete_state_input: True
+      use_rlt: True
+      rlt_alpha: 1.0
+      rlt_input_dim: 2048
+      rlt_embed_dim: 2048
+      rlt_prefix_seq_len: 1024
+      rlt_num_layers: 2
+      rlt_num_heads: 8
+      rlt_mlp_ratio: 4.0
+      rlt_encoder_type: "append_self_attention"
+      rlt_image_only: False
+      rlt_use_mask: True
+
+    openpi_data:
+      repo_id: "xingchen/fold_clothes"
+      default_prompt: "fold clothes"
+      norm_stats_path: null
+
+  optim:
+    lr: 2.5e-5
+    value_lr: 1.55e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    weight_decay: 1.0e-10
+    clip_grad: 1.0
+    total_training_steps: 10000
+    lr_warmup_steps: 500
+    lr_scheduler: "cosine"
+    num_cycles: 0.5
+    min_lr: 2.5e-6
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    use_orig_params: False
+    # Required on a single GPU: pi0.5 (~3.5B params) plus Adam states does not
+    # fit without trading compute for activation memory.
+    gradient_checkpointing: True
+    mixed_precision:
+      param_dtype: bf16
+      reduce_dtype: fp32
+      buffer_dtype: fp32
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False

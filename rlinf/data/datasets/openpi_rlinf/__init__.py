@@ -43,11 +43,20 @@ def _load_official_openpi_sft_dataloader() -> SftDataLoaderBuilder:
     return build_official_openpi_sft_dataloader
 
 
+def _load_xingchen_sft_dataloader() -> SftDataLoaderBuilder:
+    from rlinf.data.datasets.openpi_rlinf.xingchen import (
+        build_xingchen_sft_dataloader,
+    )
+
+    return build_xingchen_sft_dataloader
+
+
 # Environment name -> lazy SFT dataloader builder.
 _SFT_DATALOADER_BUILDERS = {
     "behavior": _load_behavior_sft_dataloader,
     "dualfranka": _load_dual_franka_sft_dataloader,
     "robotwin": _load_official_openpi_sft_dataloader,
+    "xingchen": _load_xingchen_sft_dataloader,
 }
 
 
@@ -70,12 +79,22 @@ def build_openpi_rlinf_sft_dataloader(
     eval_dataset: bool = False,
 ) -> tuple[Any, Any]:
     """Build the environment-specific openpi_rlinf SFT dataloader."""
-    if bool(cfg.actor.model.openpi.get("use_rlt", False)):
+    config_name = str(cfg.actor.model.openpi.config_name)
+    use_rlt = bool(cfg.actor.model.openpi.get("use_rlt", False))
+
+    # Xingchen/Songling ARIO: stream straight from S3, no LeRobot conversion.
+    # Matched by config name; takes priority over the generic RLT path.
+    if "xingchen" in config_name or "songling" in config_name:
+        return _load_xingchen_sft_dataloader()(
+            cfg, world_size, rank, data_paths, eval_dataset
+        )
+
+    if use_rlt:
         return _load_official_openpi_sft_dataloader()(
             cfg, world_size, rank, data_paths, eval_dataset
         )
 
-    env_type = _resolve_env(str(cfg.actor.model.openpi.config_name))
+    env_type = _resolve_env(config_name)
     builder = _SFT_DATALOADER_BUILDERS[env_type]()
     return builder(cfg, world_size, rank, data_paths, eval_dataset)
 

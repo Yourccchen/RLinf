@@ -73,6 +73,12 @@ from rlinf.models.embodiment.openpi.dataconfig.robocasa_dataconfig import (
 from rlinf.models.embodiment.openpi.dataconfig.robotwin_aloha_dataconfig import (
     LeRobotAlohaDataConfig,
 )
+from rlinf.models.embodiment.openpi.dataconfig.songling_rlt_dataconfig import (
+    SonglingRLTDataConfig,
+)
+from rlinf.models.embodiment.openpi.dataconfig.xingchen_rlt_dataconfig import (
+    XingchenRLTDataConfig,
+)
 
 _CONFIGS = [
     TrainConfig(
@@ -166,6 +172,96 @@ _CONFIGS = [
         ema_decay=0.999,
         num_workers=8,
         num_train_steps=5_000,
+        log_interval=5,
+        save_interval=250,
+    ),
+    TrainConfig(
+        name="pi05_rlt_songling_all",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=True,
+        ),
+        data=SonglingRLTDataConfig(
+            repo_id="songling/all_tasks",
+            base_config=DataConfig(prompt_from_task=False),
+            assets=AssetsConfig(
+                assets_dir="checkpoints/torch/pi05_rlt_songling_all/assets"
+            ),
+            default_prompt="",
+            use_delta_actions=True,
+            output_action_dim=14,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "checkpoints/jax/pi05_base"
+        ),
+        pytorch_weight_path="checkpoints/torch/pi05_base",
+        seed=0,
+        batch_size=256,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_workers=8,
+        num_train_steps=20_000,
+        log_interval=5,
+        save_interval=2500,
+    ),
+    TrainConfig(
+        name="pi05_rlt_songling_joint",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=True,
+        ),
+        data=SonglingRLTDataConfig(
+            repo_id="songling/garment_folding",
+            base_config=DataConfig(prompt_from_task=False),
+            assets=AssetsConfig(
+                assets_dir="checkpoints/torch/pi05_rlt_songling_joint/assets"
+            ),
+            default_prompt="fold clothes",
+            use_delta_actions=True,
+            output_action_dim=14,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "checkpoints/jax/pi05_base"
+        ),
+        pytorch_weight_path="checkpoints/torch/pi05_base",
+        seed=0,
+        batch_size=256,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_workers=8,
+        num_train_steps=20_000,
+        log_interval=5,
+        save_interval=2500,
+    ),
+    TrainConfig(
+        name="pi05_rlt_xingchen_joint",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=True,
+        ),
+        data=XingchenRLTDataConfig(
+            repo_id="xingchen/fold_clothes",
+            base_config=DataConfig(prompt_from_task=False),
+            assets=AssetsConfig(
+                assets_dir="checkpoints/torch/pi05_rlt_xingchen_joint/assets"
+            ),
+            multi_view=True,
+            default_prompt="fold clothes",
+            output_action_dim=31,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "checkpoints/jax/pi05_base"
+        ),
+        pytorch_weight_path="checkpoints/torch/pi05_base",
+        seed=0,
+        batch_size=256,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_workers=8,
+        num_train_steps=2000,
         log_interval=5,
         save_interval=250,
     ),
