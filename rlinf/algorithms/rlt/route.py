@@ -116,31 +116,47 @@ class RLTRoute(ABC):
 class RealworldRLTRoute(RLTRoute):
     """Actor/ref routing for realworld RLT (keyboard or env switch flags)."""
 
+    def __init__(
+        self,
+        *,
+        use_schedule: bool = False,
+        warmup_updates: int = 0,
+    ):
+        if warmup_updates < 0:
+            raise ValueError(
+                f"warmup_updates must be non-negative, got {warmup_updates}"
+            )
+        self.use_schedule = bool(use_schedule)
+        self.warmup_updates = int(warmup_updates)
+
+    def _ready_for_online(self, version: int) -> bool:
+        return not self.use_schedule or int(version) >= self.warmup_updates
+
     def route(self, ctx: RLTRouteContext) -> RLTRouteOutput:
         actions = ctx.student_actions
         result = ctx.result
-        rlt_switch_flags = _normalize_rlt_switch_flags(
-            actions,
+        critical_phase = _last_info_bool(
             ctx.rlt_switch_flags,
+            batch_size=actions.shape[0],
+            device=actions.device,
             default=ctx.default_actor_switch,
         )
+        actor_switch = critical_phase
+        if self.use_schedule:
+            actor_switch = actor_switch & self._ready_for_online(ctx.version)
         ref_actions = result["forward_inputs"]["ref_chunk"].to(
             device=actions.device, dtype=actions.dtype
         )
         routed_actions = torch.where(
-            rlt_switch_flags,
+            actor_switch[:, None, None],
             actions,
             ref_actions[:, : actions.shape[1], : actions.shape[2]],
         ).contiguous()
         result["forward_inputs"]["action"] = routed_actions.reshape(
             routed_actions.shape[0], -1
         ).contiguous()
-        result["forward_inputs"]["record_transition"] = rlt_switch_flags.reshape(
-            actions.shape[0], -1
-        )[:, :1].to(torch.bool)
-        result["forward_inputs"]["actor_switch"] = result["forward_inputs"][
-            "record_transition"
-        ]
+        result["forward_inputs"]["record_transition"] = critical_phase[:, None]
+        result["forward_inputs"]["actor_switch"] = actor_switch[:, None]
         return RLTRouteOutput(actions=routed_actions, result=result)
 
 
@@ -251,4 +267,8 @@ def build_rlt_route(cfg: Any) -> RLTRoute:
             use_schedule=bool(schedule_cfg.get("enable", False)),
             warmup_updates=int(schedule_cfg.get("warmup_post_collect_updates", 0)),
         )
-    return RealworldRLTRoute()
+    schedule_cfg = cfg.algorithm.get("rlt_schedule", {}) or {}
+    return RealworldRLTRoute(
+        use_schedule=bool(schedule_cfg.get("enable", False)),
+        warmup_updates=int(schedule_cfg.get("warmup_post_collect_updates", 0)),
+    )

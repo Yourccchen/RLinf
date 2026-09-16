@@ -98,6 +98,8 @@ embodied = [
     "opencv-python",
     "gymnasium",
     "gym",
+    "msgpack>=1.1.0",
+    "websockets>=15.0.1",
 ]
 franka = [
     "pyyaml",

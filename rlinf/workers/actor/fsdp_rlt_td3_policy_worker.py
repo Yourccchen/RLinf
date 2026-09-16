@@ -25,11 +25,64 @@ from rlinf.workers.actor.fsdp_rlt_ac_policy_worker import (
 class RLTTD3LossMixin(RLTACLossMixin):
     """Ablation-style TD3 actor objective over current RLT replay fields."""
 
+    @staticmethod
+    def _is_rollout_parameter(name: str) -> bool:
+        return name == "actor" or name.startswith("actor.")
+
+    def setup_model_and_optimizer(self, initialize_target=False) -> None:
+        super().setup_model_and_optimizer(initialize_target=initialize_target)
+        self.param_names_need_sync = [
+            name
+            for name in self.param_names_need_sync
+            if self._is_rollout_parameter(name)
+        ]
+        if not self.param_names_need_sync:
+            raise RuntimeError(
+                "RLT TD3 Actor has no parameters selected for rollout sync."
+            )
+
     def _next_actions_for_critic_target(self, next_obs):
-        return self.target_model(
+        # RLT uses the current actor with stop-gradient and target critics.
+        # The surrounding critic-target block runs under torch.no_grad().
+        return self.model(
             forward_type=ForwardType.SAC,
+            apply_reference_dropout=False,
+            apply_action_noise=bool(
+                self.cfg.algorithm.get("target_action_noise", True)
+            ),
             obs=next_obs,
         )
+
+    def _clip_optimizer_grad_norm(self, optimizer, max_norm: float):
+        # FSDP.clip_grad_norm_ performs the required cross-rank reduction for
+        # sharded parameters. Temporarily hide gradients owned by the other
+        # optimizer so actor and critic are clipped independently.
+        selected_ids = {
+            id(param) for group in optimizer.param_groups for param in group["params"]
+        }
+        hidden_grads = []
+        for param in self.model.parameters():
+            if param.grad is not None and id(param) not in selected_ids:
+                hidden_grads.append((param, param.grad))
+                param.grad = None
+        try:
+            if not any(
+                param.grad is not None
+                for group in optimizer.param_groups
+                for param in group["params"]
+            ):
+                return torch.zeros((), device=self.device)
+            return self.model.clip_grad_norm_(max_norm=max_norm)
+        finally:
+            for param, grad in hidden_grads:
+                param.grad = grad
+
+    def _clip_critic_grad_norm(self, max_norm: float):
+        return self._clip_optimizer_grad_norm(self.qf_optimizer, max_norm)
+
+    def _clip_actor_grad_norm(self, max_norm: float):
+        self.qf_optimizer.zero_grad(set_to_none=True)
+        return self._clip_optimizer_grad_norm(self.optimizer, max_norm)
 
     def _human_mask(
         self,
@@ -58,6 +111,7 @@ class RLTTD3LossMixin(RLTACLossMixin):
         actions: torch.Tensor,
         ref_chunk: torch.Tensor,
         intervene_flags: torch.Tensor | None,
+        valid_step_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         chunk_len, action_dim = self._chunk_shape()
         pi_chunk = self._flatten_chunk(pi).reshape(-1, chunk_len, action_dim)
@@ -71,11 +125,20 @@ class RLTTD3LossMixin(RLTACLossMixin):
             action_dim=action_dim,
             device=pi_chunk.device,
         )
+        if valid_step_mask is None:
+            valid_mask = torch.ones_like(human_mask)
+        else:
+            valid_mask = valid_step_mask.to(
+                device=pi_chunk.device, dtype=torch.bool
+            ).reshape_as(human_mask)
+        human_mask = human_mask & valid_mask
         bc_target = torch.where(human_mask[..., None], action_chunk, ref_chunk)
         bc_error = torch.mean(torch.square(pi_chunk - bc_target), dim=-1)
-        bc_loss = torch.mean(bc_error)
+        bc_loss = torch.sum(bc_error * valid_mask.to(bc_error.dtype)) / torch.clamp(
+            torch.sum(valid_mask.to(bc_error.dtype)), min=1.0
+        )
 
-        policy_mask = ~human_mask
+        policy_mask = valid_mask & ~human_mask
         ref_error = torch.mean(torch.square(pi_chunk - ref_chunk), dim=-1)
         human_error = torch.mean(torch.square(pi_chunk - action_chunk), dim=-1)
         bc_ref = torch.sum(ref_error * policy_mask.to(ref_error.dtype)) / torch.clamp(
@@ -96,15 +159,8 @@ class RLTTD3LossMixin(RLTACLossMixin):
         return bc_loss, metrics
 
     def _td3_actor_q(self, all_q_values: torch.Tensor) -> torch.Tensor:
-        actor_agg_q = self.cfg.algorithm.get("actor_agg_q", "min")
-        if actor_agg_q == "min":
-            return self._min_twin_q(all_q_values)
-        if actor_agg_q == "q1":
-            return self._q1(all_q_values)
-        if actor_agg_q == "mean":
-            self._require_twin_q(all_q_values)
-            return torch.mean(all_q_values, dim=-1, keepdim=True)
-        raise ValueError(f"Unsupported TD3 actor_agg_q={actor_agg_q!r}.")
+        # Q1 supplies the policy gradient; twin-min is only for bootstrap.
+        return self._q1(all_q_values)
 
     @Worker.timer("forward_actor")
     def forward_actor(self, batch):
@@ -153,6 +209,7 @@ class RLTTD3LossMixin(RLTACLossMixin):
             actions=batch["actions"],
             ref_chunk=ref_chunk,
             intervene_flags=batch.get("intervene_flags", None),
+            valid_step_mask=self._valid_step_mask(batch, batch["rewards"]),
         )
         metrics.update(td3_metrics)
 

@@ -12,12 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import queue
+import random
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
-from rlinf.algorithms.rlt.transition import use_simulator_transition_replay
+from rlinf.algorithms.rlt.transition import (
+    use_rlt_transition_replay,
+    use_simulator_transition_replay,
+)
 from rlinf.data.schema.embodied_types import Trajectory
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.scheduler import Worker
@@ -42,6 +48,92 @@ class RLTACLossMixin:
     RLT objective disables entropy/alpha and uses a fixed-std actor, min-Q
     critic target, Q1 actor objective, and BC regularization.
     """
+
+    def _rlt_checkpoint_state(self) -> dict:
+        state = {
+            "update_step": int(getattr(self, "update_step", 0)),
+            "transitions_since_train": int(
+                getattr(self, "transitions_since_train", 0)
+            ),
+            "episodes_since_train": int(getattr(self, "episodes_since_train", 0)),
+            "total_transitions_added": int(
+                getattr(self, "total_transitions_added", 0)
+            ),
+            "total_episodes_added": int(getattr(self, "total_episodes_added", 0)),
+            "warmup_ready_total_transitions": getattr(
+                self, "_warmup_ready_total_transitions", None
+            ),
+            "warmup_ready_total_episodes": getattr(
+                self, "_warmup_ready_total_episodes", None
+            ),
+            "pending_update_budget": int(
+                getattr(self, "pending_update_budget", 0)
+            ),
+            "torch_rng_state": torch.random.get_rng_state(),
+            "numpy_rng_state": np.random.get_state(),
+            "python_rng_state": random.getstate(),
+            "metadata": {
+                "action_dim": int(self.cfg.actor.model.action_dim),
+                "num_action_chunks": int(self.cfg.actor.model.num_action_chunks),
+                "z_dim": int(self.cfg.actor.model.z_dim),
+                "proprio_dim": int(self.cfg.actor.model.proprio_dim),
+                "target_actor": False,
+            },
+        }
+        if torch.cuda.is_available():
+            state["cuda_rng_state_all"] = torch.cuda.get_rng_state_all()
+        return state
+
+    def save_checkpoint(self, save_base_path, step):
+        super().save_checkpoint(save_base_path, step)
+        state_dir = os.path.join(save_base_path, "sac_components/rlt_state")
+        os.makedirs(state_dir, exist_ok=True)
+        torch.save(
+            self._rlt_checkpoint_state(),
+            os.path.join(state_dir, f"checkpoint_rank_{self._rank}.pt"),
+        )
+
+    def load_checkpoint(self, load_base_path):
+        super().load_checkpoint(load_base_path)
+        state_path = os.path.join(
+            load_base_path,
+            "sac_components/rlt_state",
+            f"checkpoint_rank_{self._rank}.pt",
+        )
+        if not os.path.isfile(state_path):
+            self.logger.warning("RLT scheduler state not found at %s", state_path)
+            return
+        state = torch.load(state_path, map_location="cpu", weights_only=False)
+        expected = {
+            "action_dim": int(self.cfg.actor.model.action_dim),
+            "num_action_chunks": int(self.cfg.actor.model.num_action_chunks),
+            "z_dim": int(self.cfg.actor.model.z_dim),
+            "proprio_dim": int(self.cfg.actor.model.proprio_dim),
+            "target_actor": False,
+        }
+        if state.get("metadata") != expected:
+            raise ValueError(
+                "Incompatible RLT checkpoint metadata: "
+                f"expected {expected}, got {state.get('metadata')}."
+            )
+        for key in (
+            "update_step",
+            "transitions_since_train",
+            "episodes_since_train",
+            "total_transitions_added",
+            "total_episodes_added",
+            "pending_update_budget",
+        ):
+            setattr(self, key, int(state.get(key, 0)))
+        self._warmup_ready_total_transitions = state.get(
+            "warmup_ready_total_transitions"
+        )
+        self._warmup_ready_total_episodes = state.get("warmup_ready_total_episodes")
+        torch.random.set_rng_state(state["torch_rng_state"])
+        np.random.set_state(state["numpy_rng_state"])
+        random.setstate(state["python_rng_state"])
+        if torch.cuda.is_available() and "cuda_rng_state_all" in state:
+            torch.cuda.set_rng_state_all(state["cuda_rng_state_all"])
 
     @staticmethod
     def _flatten_chunk(tensor: torch.Tensor) -> torch.Tensor:
@@ -83,7 +175,29 @@ class RLTACLossMixin:
         self._require_twin_q(all_q_values)
         return all_q_values[..., 0:1]
 
-    def _discounted_chunk_rewards(self, rewards: torch.Tensor) -> torch.Tensor:
+    def _valid_step_mask(self, batch: dict, rewards: torch.Tensor) -> torch.Tensor:
+        forward_inputs = batch.get("forward_inputs", {})
+        mask = (
+            forward_inputs.get("valid_step_mask")
+            if isinstance(forward_inputs, dict)
+            else None
+        )
+        rewards_flat = rewards.reshape(rewards.shape[0], -1)
+        if mask is None:
+            return torch.ones_like(rewards_flat, dtype=torch.bool)
+        mask = mask.to(device=rewards.device, dtype=torch.bool).reshape(
+            rewards.shape[0], -1
+        )
+        if mask.shape != rewards_flat.shape:
+            raise ValueError(
+                "valid_step_mask must match chunk rewards, got "
+                f"mask={tuple(mask.shape)}, rewards={tuple(rewards_flat.shape)}."
+            )
+        return mask
+
+    def _discounted_chunk_rewards(
+        self, rewards: torch.Tensor, valid_step_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
         rewards = rewards.reshape(rewards.shape[0], -1)
         rewards = rewards.to(self.torch_dtype)
         chunk_len = rewards.shape[-1]
@@ -91,7 +205,25 @@ class RLTACLossMixin:
             torch.as_tensor(self.cfg.algorithm.gamma, device=rewards.device),
             torch.arange(chunk_len, device=rewards.device, dtype=rewards.dtype),
         )
+        if valid_step_mask is not None:
+            rewards = rewards * valid_step_mask.to(rewards.dtype)
         return torch.sum(rewards * discounts, dim=-1, keepdim=True)
+
+    def _chunk_bootstrap_discount(
+        self, valid_step_mask: torch.Tensor, *, dtype: torch.dtype
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        reward_horizon = valid_step_mask.sum(dim=-1, keepdim=True).to(dtype=dtype)
+        full_horizon = valid_step_mask.shape[-1]
+        has_full_horizon = reward_horizon == full_horizon
+        discount = torch.pow(
+            torch.as_tensor(
+                self.cfg.algorithm.gamma,
+                device=valid_step_mask.device,
+                dtype=dtype,
+            ),
+            reward_horizon,
+        )
+        return discount * has_full_horizon.to(dtype), has_full_horizon
 
     def _bc_metrics(
         self,
@@ -99,6 +231,7 @@ class RLTACLossMixin:
         actions: torch.Tensor,
         ref_chunk: torch.Tensor,
         intervene_flags: torch.Tensor | None,
+        valid_step_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         chunk_len, action_dim = self._chunk_shape()
         pi_chunk = self._flatten_chunk(pi).reshape(-1, chunk_len, action_dim)
@@ -120,11 +253,20 @@ class RLTACLossMixin:
                 .any(dim=-1)
             )
 
+        if valid_step_mask is None:
+            valid_mask = torch.ones_like(human_mask)
+        else:
+            valid_mask = valid_step_mask.to(
+                device=pi_chunk.device, dtype=torch.bool
+            ).reshape_as(human_mask)
+        human_mask = human_mask & valid_mask
         bc_target = torch.where(human_mask[..., None], action_chunk, bc_ref_chunk)
         bc_error = torch.mean(torch.square(pi_chunk - bc_target), dim=-1)
-        bc_loss = torch.mean(bc_error)
+        bc_loss = torch.sum(bc_error * valid_mask.to(bc_error.dtype)) / torch.clamp(
+            torch.sum(valid_mask.to(bc_error.dtype)), min=1.0
+        )
 
-        policy_mask = ~human_mask
+        policy_mask = valid_mask & ~human_mask
         ref_error = torch.mean(torch.square(pi_chunk - bc_ref_chunk), dim=-1)
         human_error = torch.mean(torch.square(pi_chunk - action_chunk), dim=-1)
         bc_ref = torch.sum(ref_error * policy_mask.to(ref_error.dtype)) / torch.clamp(
@@ -266,9 +408,16 @@ class RLTACLossMixin:
                 )
                 q_next = self._min_twin_q(all_qf_next.detach())
 
-            reward_target = self._discounted_chunk_rewards(rewards)
-            reward_horizon = int(rewards.reshape(rewards.shape[0], -1).shape[-1])
-            bootstrap_discount = self.cfg.algorithm.gamma**reward_horizon
+            valid_step_mask = self._valid_step_mask(batch, rewards)
+            reward_target = self._discounted_chunk_rewards(
+                rewards, valid_step_mask=valid_step_mask
+            )
+            # A short chunk means the environment ended or communication became
+            # uncertain before C actions. There is no valid next C-step state.
+            bootstrap_discount, has_full_horizon = self._chunk_bootstrap_discount(
+                valid_step_mask, dtype=q_next.dtype
+            )
+            not_done = not_done & has_full_horizon
             if bootstrap_type == "always":
                 target_q_values = reward_target + bootstrap_discount * q_next
             elif bootstrap_type == "standard":
@@ -346,6 +495,7 @@ class RLTACLossMixin:
             actions=batch["actions"],
             ref_chunk=ref_chunk,
             intervene_flags=batch.get("intervene_flags", None),
+            valid_step_mask=self._valid_step_mask(batch, batch["rewards"]),
         )
         metrics.update(rlt_metrics)
 
@@ -456,7 +606,17 @@ class RLTACReplayMixin:
             return False
         if idx >= record_transition.shape[0]:
             return False
-        return bool(record_transition[idx].detach().to(torch.bool).reshape(-1).all())
+        should_record = bool(
+            record_transition[idx].detach().to(torch.bool).reshape(-1).all()
+        )
+        valid_step_mask = forward_inputs.get("valid_step_mask")
+        if isinstance(valid_step_mask, torch.Tensor):
+            if idx >= valid_step_mask.shape[0]:
+                return False
+            should_record = should_record and bool(
+                valid_step_mask[idx].detach().to(torch.bool).reshape(-1).any()
+            )
+        return should_record
 
     def _transition_replay_trajectories(
         self,
@@ -610,7 +770,7 @@ class RLTACReplayMixin:
     ) -> tuple[int, int]:
         self._last_replay_metrics = {}
 
-        if use_simulator_transition_replay(self.cfg):
+        if use_rlt_transition_replay(self.cfg):
             replay_list = []
             completed = 0
             for traj in recv_list:

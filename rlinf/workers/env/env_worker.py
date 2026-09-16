@@ -543,6 +543,12 @@ class EnvWorker(Worker):
                 for key in final_info["episode"]:
                     env_info[key] = final_info["episode"][key][chunk_dones[:, -1]].cpu()
 
+        executed_actions = (
+            infos["executed_actions"] if "executed_actions" in infos else None
+        )
+        valid_step_mask = (
+            infos["valid_step_mask"] if "valid_step_mask" in infos else None
+        )
         intervene_actions = (
             infos["intervene_action"] if "intervene_action" in infos else None
         )
@@ -563,6 +569,8 @@ class EnvWorker(Worker):
             dones=chunk_dones,
             terminations=chunk_terminations,
             truncations=chunk_truncations,
+            executed_actions=executed_actions,
+            valid_step_mask=valid_step_mask,
             intervene_actions=intervene_actions,
             intervene_flags=intervene_flags,
             rlt_switch_flags=rlt_switch_flags,
@@ -952,6 +960,11 @@ class EnvWorker(Worker):
                     env_infos=infos if isinstance(infos, dict) else None,
                     intervene_actions=None,
                     intervene_flags=None,
+                    rlt_switch_flags=(
+                        infos.get("rlt_switch_flags")
+                        if isinstance(infos, dict)
+                        else None
+                    ),
                 )
                 env_outputs.append(env_output)
         else:
@@ -973,7 +986,12 @@ class EnvWorker(Worker):
 
         return env_outputs
 
-    def _build_rollout_input_data(self, env_batch: dict[str, Any]) -> dict[str, Any]:
+    def _build_rollout_input_data(
+        self,
+        env_batch: dict[str, Any],
+        *,
+        force_episode_boundary: bool = False,
+    ) -> dict[str, Any]:
         data = {
             "obs": env_batch["obs"],
             "final_obs": env_batch["final_obs"],
@@ -981,6 +999,19 @@ class EnvWorker(Worker):
         if self.enable_rlt:
             data["rlt_switch_flags"] = env_batch.get("rlt_switch_flags", None)
             data["intervene_flags"] = env_batch.get("intervene_flags", None)
+            states = env_batch["obs"].get("states")
+            if states is None:
+                raise ValueError("RLT rollout observations require batched states.")
+            if force_episode_boundary:
+                boundary = torch.ones(states.shape[0], dtype=torch.bool)
+            else:
+                dones = env_batch.get("dones", None)
+                boundary = (
+                    torch.as_tensor(dones).reshape(states.shape[0], -1).any(dim=-1)
+                    if dones is not None
+                    else torch.zeros(states.shape[0], dtype=torch.bool)
+                )
+            data["episode_boundary"] = boundary
         return data
 
     def _split_and_compress_obs(
@@ -1017,7 +1048,9 @@ class EnvWorker(Worker):
             self.send_to(
                 group_name=self.cfg.rollout.group_name,
                 channel=rollout_channel,
-                data=self._build_rollout_input_data(env_batch),
+                data=self._build_rollout_input_data(
+                    env_batch, force_episode_boundary=True
+                ),
                 split_fn=self._obs_split_fn,
                 mode="train",
                 tag="rollout_results",
@@ -1133,6 +1166,14 @@ class EnvWorker(Worker):
 
                     env_output = env_outputs[stage_id]
                     curr_obs = env_output.obs
+                    if env_output.executed_actions is not None:
+                        self.trajectory_builders[stage_id].set_last_actions(
+                            env_output.executed_actions
+                        )
+                    if env_output.valid_step_mask is not None:
+                        self.trajectory_builders[stage_id].update_last_forward_inputs(
+                            {"valid_step_mask": env_output.valid_step_mask}
+                        )
                     if env_output.intervene_actions is not None:
                         self.trajectory_builders[stage_id].update_last_actions(
                             env_output.intervene_actions,
@@ -1221,6 +1262,18 @@ class EnvWorker(Worker):
                             intervene_flags=env_output.intervene_flags,
                         )
 
+                    set_policy_version = get_env_attr(
+                        self.env_list[stage_id], "set_policy_version"
+                    )
+                    if (
+                        set_policy_version is not None
+                        and policy_output.versions is not None
+                    ):
+                        set_policy_version(
+                            int(
+                                policy_output.versions.detach().reshape(-1).max().item()
+                            )
+                        )
                     env_output, env_info, chunk_step_payload = self.env_interact_step(
                         policy_output.actions,
                         stage_id,
@@ -1279,6 +1332,14 @@ class EnvWorker(Worker):
 
             for stage_id in range(self.stage_num):
                 env_output = env_outputs[stage_id]
+                if env_output.executed_actions is not None:
+                    self.trajectory_builders[stage_id].set_last_actions(
+                        env_output.executed_actions
+                    )
+                if env_output.valid_step_mask is not None:
+                    self.trajectory_builders[stage_id].update_last_forward_inputs(
+                        {"valid_step_mask": env_output.valid_step_mask}
+                    )
                 if env_output.intervene_actions is not None:
                     self.trajectory_builders[stage_id].update_last_actions(
                         env_output.intervene_actions,

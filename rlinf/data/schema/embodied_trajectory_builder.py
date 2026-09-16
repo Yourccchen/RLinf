@@ -109,6 +109,22 @@ class EmbodiedTrajectoryBuilder:
         )
         self.intervene_flags[-1] = expanded_flags.reshape(bsz, -1).to(torch.bool)
 
+    def set_last_actions(self, actions: torch.Tensor) -> None:
+        """Replace the last proposed chunk with the actions actually executed."""
+        if not self.actions:
+            return
+        last_action = self.actions[-1]
+        actions = actions.reshape_as(last_action).cpu().contiguous()
+        self.actions[-1] = actions
+        if self.forward_inputs and "action" in self.forward_inputs[-1]:
+            self.forward_inputs[-1]["action"] = actions
+
+    def update_last_forward_inputs(self, values: dict[str, Any]) -> None:
+        if self.forward_inputs:
+            self.forward_inputs[-1].update(
+                {key: value.cpu().contiguous() for key, value in values.items()}
+            )
+
     def update_last_actions(
         self, intervene_actions: torch.Tensor, intervene_flags: torch.Tensor
     ):
@@ -433,6 +449,12 @@ class EmbodiedLerobotTrajectoryBuilder(EmbodiedTrajectoryBuilder):
     def append_step_result(self, result: ChunkStepResult):
         if result.rewards is not None:
             self.rewards.append(result.rewards)
+
+    def set_last_actions(self, actions: torch.Tensor) -> None:
+        return
+
+    def update_last_forward_inputs(self, values: dict[str, Any]) -> None:
+        return
 
     def update_last_actions(
         self, intervene_actions: torch.Tensor, intervene_flags: torch.Tensor

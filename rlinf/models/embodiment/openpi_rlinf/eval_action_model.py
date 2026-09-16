@@ -139,6 +139,23 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
             return states.index_select(-1, index_tensor)
         return np.asarray(states)[..., indices]
 
+    def _select_rlt_proprio(self, raw_proprio, normalized_state):
+        """Use Stage1-normalized proprio where the RLT contract requires it."""
+        config_name = self.config_name.lower()
+        if "maniskill" not in config_name and "songling" not in config_name:
+            return raw_proprio
+        state_dim = (
+            raw_proprio.shape[-1]
+            if hasattr(raw_proprio, "shape")
+            else np.asarray(raw_proprio).shape[-1]
+        )
+        if normalized_state.shape[-1] < state_dim:
+            raise ValueError(
+                "Normalized OpenPI state is smaller than the RLT proprio state: "
+                f"normalized={normalized_state.shape[-1]}, proprio={state_dim}."
+            )
+        return normalized_state[..., :state_dim]
+
     def _repack_env_obs(self, env_obs: dict) -> dict:
         """Map the env's observation dict to the ``observation/*`` keys the
         openpi pipeline expects.
@@ -155,22 +172,48 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
         (BEHAVIOR, for instance, emits no ``extra_view_images`` key).
         """
         env_states = self._select_configured_state(env_obs["states"])
+        main_images = env_obs["main_images"]
         processed_obs = {
-            "observation/image": env_obs["main_images"],
+            "observation/image": main_images,
             "prompt": env_obs["task_descriptions"],
         }
-        if "calvin" in self.config_name:
+        config_name = self.config_name.lower()
+        if "songling" in config_name:
+            # Songling Stage 1 was trained with an overhead view plus both wrist
+            # views. Do not silently fall back to masked zero wrist images here:
+            # that would change the frozen feature distribution in Stage 2.
+            wrist_images = env_obs.get("wrist_images", env_obs.get("extra_view_images"))
+            if wrist_images is None:
+                raise KeyError(
+                    "Songling RLT observations require wrist_images (or "
+                    "extra_view_images) containing left and right wrist views."
+                )
+            wrist_shape = tuple(wrist_images.shape)
+            if len(wrist_shape) != 5 or wrist_shape[1] != 2:
+                raise ValueError(
+                    "Songling wrist images must have shape [B, 2, H, W, C] "
+                    f"(left then right), got {wrist_shape}."
+                )
+            processed_obs.update(
+                {
+                    "observation/cam_high": main_images,
+                    "observation/cam_left_wrist": wrist_images[:, 0],
+                    "observation/cam_right_wrist": wrist_images[:, 1],
+                }
+            )
+        if "calvin" in config_name:
             processed_obs["observation/state_ee_pos"] = env_states[:, :3]
             processed_obs["observation/state_ee_rot"] = env_states[:, 3:6]
             processed_obs["observation/state_gripper"] = env_states[:, 6:7]
         else:
             processed_obs["observation/state"] = env_states
-        wrist_images = env_obs.get("wrist_images")
-        if wrist_images is not None:
-            processed_obs["observation/wrist_image"] = wrist_images
-        extra_view_images = env_obs.get("extra_view_images")
-        if extra_view_images is not None:
-            processed_obs["observation/extra_view_image"] = extra_view_images
+        if "songling" not in config_name:
+            wrist_images = env_obs.get("wrist_images")
+            if wrist_images is not None:
+                processed_obs["observation/wrist_image"] = wrist_images
+            extra_view_images = env_obs.get("extra_view_images")
+            if extra_view_images is not None:
+                processed_obs["observation/extra_view_image"] = extra_view_images
         return processed_obs
 
     def input_transform(self, obs: dict, transpose: bool = False) -> dict:
@@ -354,14 +397,18 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
         }
         return actions, result
 
-    @torch.no_grad()
-    def extract_rlt_obs(self, env_obs: dict[str, Any]) -> dict[str, torch.Tensor]:
-        """Extract the frozen Stage1 features consumed by the Stage2 RLT head."""
+    def _extract_rlt_prefix_features(self, env_obs: dict[str, Any]) -> tuple[
+        Observation,
+        Observation,
+        torch.Tensor,
+        tuple,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         self._require_rlt()
         repacked = self._repack_env_obs(env_obs)
         processed = self.input_transform(repacked, transpose=False)
         observation = self._observation_dict_to_device(processed)
-
         prepared_observation = pi0_model_module.preprocess_observation(
             observation, train=False
         )
@@ -374,32 +421,56 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
         z_rl = self._encode_rlt_flat(rlt_prefix_output, rlt_prefix_mask).to(
             dtype=torch.float32
         )
+        raw_proprio = self._select_configured_state(env_obs["states"])
+        proprio = self._select_rlt_proprio(raw_proprio, observation.state)
+        if not torch.is_tensor(proprio):
+            proprio = torch.as_tensor(proprio)
+        proprio = proprio.to(device=z_rl.device, dtype=torch.float32)
+        return (
+            observation,
+            prepared_observation,
+            prefix_mask,
+            kv_cache,
+            z_rl,
+            proprio,
+        )
 
+    @torch.no_grad()
+    def extract_rlt_token_obs(self, env_obs: dict[str, Any]) -> dict[str, torch.Tensor]:
+        """Extract only z_rl/proprio without running the flow action sampler."""
+        *_, z_rl, proprio = self._extract_rlt_prefix_features(env_obs)
+        return {"z_rl": z_rl, "proprio": proprio}
+
+    @torch.no_grad()
+    def extract_rlt_obs(
+        self,
+        env_obs: dict[str, Any],
+        *,
+        rng: torch.Generator | None = None,
+        noise: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Extract frozen Stage1 features and a traceable reference chunk."""
+        (
+            observation,
+            prepared_observation,
+            prefix_mask,
+            kv_cache,
+            z_rl,
+            proprio,
+        ) = self._extract_rlt_prefix_features(env_obs)
         model_actions = self._sample_actions_from_prefix_cache(
             prepared_observation,
             prefix_mask,
             kv_cache,
+            noise=noise,
+            rng=rng,
         )
         ref_chunk = self.output_transform(
             {"actions": model_actions, "state": observation.state}
         )["actions"]
-
-        raw_proprio = self._select_configured_state(env_obs["states"])
-        if "maniskill" in self.config_name.lower():
-            state_dim = (
-                raw_proprio.shape[-1]
-                if hasattr(raw_proprio, "shape")
-                else np.asarray(raw_proprio).shape[-1]
-            )
-            proprio = observation.state[..., :state_dim]
-        else:
-            proprio = raw_proprio
-        if not torch.is_tensor(proprio):
-            proprio = torch.as_tensor(proprio)
-
         return {
             "z_rl": z_rl,
-            "proprio": proprio.to(device=z_rl.device, dtype=torch.float32),
+            "proprio": proprio,
             "ref_chunk": ref_chunk.to(device=z_rl.device, dtype=torch.float32),
         }
 

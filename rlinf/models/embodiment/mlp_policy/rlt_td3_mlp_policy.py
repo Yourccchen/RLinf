@@ -233,15 +233,30 @@ class RLTTD3MLPPolicy(nn.Module, BasePolicy):
         return tensor.reshape(tensor.shape[0], -1)
 
     def _get_z(self, obs: dict) -> torch.Tensor:
-        return self._flatten_batch(obs["z_rl"])
+        z_rl = self._flatten_batch(obs["z_rl"])
+        if z_rl.shape[-1] != self.z_dim:
+            raise ValueError(
+                f"Expected z_rl last dim {self.z_dim}, got {tuple(z_rl.shape)}."
+            )
+        return z_rl
 
     def _get_proprio(self, obs: dict) -> torch.Tensor:
-        return self._flatten_batch(obs["proprio"])
+        proprio = self._flatten_batch(obs["proprio"])
+        if proprio.shape[-1] != self.proprio_dim:
+            raise ValueError(
+                f"Expected proprio last dim {self.proprio_dim}, got {tuple(proprio.shape)}."
+            )
+        return proprio
 
     def _get_ref_chunk(self, obs: dict) -> torch.Tensor:
-        ref_chunk = self._flatten_batch(obs["ref_chunk"]).reshape(
-            obs["ref_chunk"].shape[0], -1, self.step_action_dim
-        )
+        ref_chunk = self._flatten_batch(obs["ref_chunk"])
+        expected_dim = self.ref_chunk_len * self.step_action_dim
+        if ref_chunk.shape[-1] != expected_dim:
+            raise ValueError(
+                "Expected ref_chunk flattened dim "
+                f"{expected_dim}, got {tuple(ref_chunk.shape)}."
+            )
+        ref_chunk = ref_chunk.reshape(-1, self.ref_chunk_len, self.step_action_dim)
         ref_chunk = ref_chunk[:, : self.chunk_len]
         return ref_chunk.reshape(ref_chunk.shape[0], -1)
 
@@ -249,6 +264,11 @@ class RLTTD3MLPPolicy(nn.Module, BasePolicy):
         return torch.cat([self._get_z(obs), self._get_proprio(obs)], dim=-1)
 
     def _format_chunk_actions(self, actions: torch.Tensor) -> torch.Tensor:
+        actions = self._flatten_batch(actions)
+        if actions.shape[-1] != self.flat_action_dim:
+            raise ValueError(
+                f"Expected action dim {self.flat_action_dim}, got {tuple(actions.shape)}."
+            )
         return actions.reshape(-1, self.chunk_len, self.step_action_dim)
 
     def default_forward(self, **kwargs):
@@ -310,7 +330,7 @@ class RLTTD3MLPPolicy(nn.Module, BasePolicy):
         state = self._state(obs)
         if detach_encoder:
             state = state.detach()
-        return self.q_head(state, self._flatten_batch(actions))
+        return self.q_head(state, self._format_chunk_actions(actions).flatten(1))
 
     def crossq_q_forward(
         self,

@@ -49,6 +49,8 @@ class EnvOutput:
     rewards: Optional[torch.Tensor] = None  # [B]
     env_infos: Optional[dict[str, Any]] = None
 
+    executed_actions: Optional[torch.Tensor] = None  # [B, chunk * action_dim]
+    valid_step_mask: Optional[torch.Tensor] = None  # [B, chunk]
     intervene_actions: Optional[torch.Tensor] = None  # [B]
     intervene_flags: Optional[torch.Tensor] = None  # [B]
     rlt_switch_flags: Optional[torch.Tensor] = None  # [B] or [B, action_chunk]
@@ -77,6 +79,16 @@ class EnvOutput:
         self.env_infos = (
             put_tensor_device(self.env_infos, "cpu")
             if self.env_infos is not None
+            else None
+        )
+        self.executed_actions = (
+            self.executed_actions.cpu().contiguous()
+            if self.executed_actions is not None
+            else None
+        )
+        self.valid_step_mask = (
+            self.valid_step_mask.cpu().contiguous()
+            if self.valid_step_mask is not None
             else None
         )
         self.intervene_actions = (
@@ -217,6 +229,12 @@ class EnvOutput:
             terminations=_merge_optional_tensor_field("terminations"),
             truncations=_merge_optional_tensor_field("truncations"),
             rewards=_merge_optional_tensor_field("rewards"),
+            executed_actions=_merge_optional_tensor_field(
+                "executed_actions", allow_partial_none=True, fill_value=0.0
+            ),
+            valid_step_mask=_merge_optional_tensor_field(
+                "valid_step_mask", allow_partial_none=True, fill_value=False
+            ),
             intervene_actions=_merge_optional_tensor_field(
                 "intervene_actions", allow_partial_none=True, fill_value=0.0
             ),
@@ -241,6 +259,8 @@ class EnvOutput:
             "truncations": self.truncations,
             "rewards": self.rewards,
             "env_infos": self.env_infos,
+            "executed_actions": self.executed_actions,
+            "valid_step_mask": self.valid_step_mask,
             "intervene_actions": self.intervene_actions,
             "intervene_flags": self.intervene_flags,
             "rlt_switch_flags": self.rlt_switch_flags,

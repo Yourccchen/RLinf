@@ -184,6 +184,9 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             enable_cache=self.cfg.algorithm.replay_buffer.enable_cache,
             cache_size=self.cfg.algorithm.replay_buffer.cache_size,
             sample_window_size=self.cfg.algorithm.replay_buffer.sample_window_size,
+            max_num_samples=self.cfg.algorithm.replay_buffer.get(
+                "max_num_samples", None
+            ),
             auto_save=self.cfg.algorithm.replay_buffer.get("auto_save", False),
             auto_save_path=auto_save_path,
             trajectory_format=self.cfg.algorithm.replay_buffer.get(
@@ -205,6 +208,9 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 enable_cache=self.cfg.algorithm.demo_buffer.enable_cache,
                 cache_size=self.cfg.algorithm.demo_buffer.cache_size,
                 sample_window_size=self.cfg.algorithm.demo_buffer.sample_window_size,
+                max_num_samples=self.cfg.algorithm.demo_buffer.get(
+                    "max_num_samples", None
+                ),
                 auto_save=self.cfg.algorithm.demo_buffer.get("auto_save", False),
                 auto_save_path=auto_save_path,
                 trajectory_format="pt",
@@ -217,6 +223,15 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                     local_rank=self._rank,
                     world_size=self._world_size,
                 )
+
+        replay_load_path = self.cfg.algorithm.replay_buffer.get("load_path", None)
+        if replay_load_path is not None:
+            self.replay_buffer.load_checkpoint(
+                replay_load_path,
+                is_distributed=True,
+                local_rank=self._rank,
+                world_size=self._world_size,
+            )
 
         if self.cfg.algorithm.replay_buffer.get("enable_preload", False):
             buffer_dataset_cls = PreloadReplayBufferDataset
@@ -582,7 +597,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         all_critic_metrics = {
             f"critic/{key}": np.mean(value) for key, value in all_critic_metrics.items()
         }
-        qf_grad_norm = self.model.clip_grad_norm_(
+        qf_grad_norm = self._clip_critic_grad_norm(
             max_norm=self.cfg.actor.critic_optim.clip_grad
         )
 
@@ -612,7 +627,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 f"actor/{key}": np.mean(value)
                 for key, value in all_actor_metrics.items()
             }
-            actor_grad_norm = self.model.clip_grad_norm_(
+            actor_grad_norm = self._clip_actor_grad_norm(
                 max_norm=self.cfg.actor.optim.clip_grad
             )
             self.optimizer.step()
@@ -661,6 +676,14 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             self.soft_update_target_model()
 
         return metrics_data
+
+    def _clip_critic_grad_norm(self, max_norm: float):
+        """Clip critic-step gradients; subclasses may narrow the parameter set."""
+        return self.model.clip_grad_norm_(max_norm=max_norm)
+
+    def _clip_actor_grad_norm(self, max_norm: float):
+        """Clip actor-step gradients; subclasses may narrow the parameter set."""
+        return self.model.clip_grad_norm_(max_norm=max_norm)
 
     def process_train_metrics(self, metrics):
         replay_buffer_stats = self.replay_buffer.get_stats()

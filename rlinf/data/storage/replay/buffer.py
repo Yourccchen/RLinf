@@ -216,6 +216,14 @@ class TrajectoryCache:
         self._insert_into_buffer(trajectory, self._buffer, start)
         self._traj_key_lengths[trajectory_id] = key_lengths
 
+    def remove(self, trajectory_id: int) -> None:
+        slot = self.cache.pop(trajectory_id, None)
+        self._traj_key_lengths.pop(trajectory_id, None)
+        if slot is None:
+            return
+        if self._slot_to_id.get(slot) == trajectory_id:
+            self._slot_to_id.pop(slot, None)
+
     def clear(self):
         self.cache.clear()
         self._buffer = None
@@ -239,6 +247,7 @@ class TrajectoryReplayBuffer:
         cache_size: int = 5,
         sample_window_size: int = 100,
         auto_save: bool = False,
+        max_num_samples: int | None = None,
         auto_save_path: str = "",
         trajectory_format: str = "pt",
     ):
@@ -257,6 +266,7 @@ class TrajectoryReplayBuffer:
         self.trajectory_format = trajectory_format
         self.enable_cache = enable_cache
         self.sample_window_size = sample_window_size
+        self.max_num_samples = None if max_num_samples is None else int(max_num_samples)
         self.auto_save = auto_save
         self.logger = get_logger()
 
@@ -365,6 +375,11 @@ class TrajectoryReplayBuffer:
                 "total_samples": self._total_samples,
                 "trajectory_counter": self._trajectory_counter,
                 "seed": self.seed,
+                "random_generator_state": (
+                    self.random_generator.get_state().tolist()
+                    if self.random_generator is not None
+                    else None
+                ),
             }
             with open(self._get_metadata_path(save_path), "w") as f:
                 json.dump(metadata, f)
@@ -438,6 +453,23 @@ class TrajectoryReplayBuffer:
 
         return trajectory
 
+    def _enforce_max_num_samples_locked(self) -> None:
+        """Evict oldest trajectories at a trajectory-granular sample limit."""
+        if self.max_num_samples is None or self.max_num_samples <= 0:
+            return
+        while (
+            self._total_samples > self.max_num_samples
+            and len(self._trajectory_id_list) > 1
+        ):
+            trajectory_id = self._trajectory_id_list.pop(0)
+            info = self._trajectory_index.pop(trajectory_id)
+            self._trajectory_file_path.pop(trajectory_id, None)
+            self._total_samples -= int(info["num_samples"])
+            self.size -= 1
+            if self._flat_trajectory_cache is not None:
+                self._flat_trajectory_cache.remove(trajectory_id)
+            self._index_version += 1
+
     def add_trajectories(self, trajectories: list[Trajectory]):
         """
         Add trajectories to the buffer.
@@ -497,6 +529,7 @@ class TrajectoryReplayBuffer:
                 self.size += 1
                 self._total_samples += num_samples
                 self._index_version += 1
+                self._enforce_max_num_samples_locked()
 
             if self._flat_trajectory_cache is not None:
                 self._flat_trajectory_cache.put(
@@ -1026,6 +1059,11 @@ class TrajectoryReplayBuffer:
         if "seed" in metadata:
             self.seed = metadata["seed"]
             self._init_random_generator(self.seed)
+        generator_state = metadata.get("random_generator_state")
+        if generator_state is not None and self.random_generator is not None:
+            self.random_generator.set_state(
+                torch.as_tensor(generator_state, dtype=torch.uint8)
+            )
 
         # Load trajectory index and uuid list from save_path
         index_path = os.path.join(load_path, "trajectory_index.json")

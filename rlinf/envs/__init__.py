@@ -34,6 +34,7 @@ class SupportedEnvType(Enum):
     ROBOCASA = "robocasa"
     ROBOCASA365 = "robocasa365"
     REAL = "real"
+    REMOTE_SONGLING = "remote_songling"
     FRANKASIM = "frankasim"
     HABITAT = "habitat"
     OPENSORAWM = "opensora_wm"
@@ -138,6 +139,10 @@ def get_env_cls(env_type: str, env_cfg=None):
         from rlinf.envs.real import RealWorldEnv
 
         return RealWorldEnv
+    elif env_type == SupportedEnvType.REMOTE_SONGLING:
+        from rlinf.envs.remote_songling import RemoteSonglingEnv
+
+        return RemoteSonglingEnv
     elif env_type == SupportedEnvType.HABITAT:
         from rlinf.envs.sim.habitat.habitat_env import HabitatEnv
 

@@ -13,7 +13,11 @@
 # limitations under the License.
 
 from rlinf.algorithms.expert import build_expert_model_config
-from rlinf.algorithms.rlt.rollout import predict_rlt_actions
+from rlinf.algorithms.rlt.rollout import (
+    predict_rlt_actions,
+    validate_online_transition_stride,
+    validate_rlt_stage2_configs,
+)
 from rlinf.algorithms.rlt.route import (
     RealworldRLTRoute,
     RLTRoute,
@@ -32,4 +36,6 @@ __all__ = [
     "build_rlt_route",
     "predict_rlt_actions",
     "use_simulator_transition_replay",
+    "validate_online_transition_stride",
+    "validate_rlt_stage2_configs",
 ]

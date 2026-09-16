@@ -37,6 +37,21 @@ def use_simulator_transition_replay(cfg: Any) -> bool:
         return False
 
 
+def use_rlt_transition_replay(cfg: Any) -> bool:
+    """Use per-row filtered replay for simulator and real RLT rollouts."""
+    train_env_cfg = cfg.env.get("train", None)
+    if train_env_cfg is None:
+        return False
+    try:
+        return SupportedEnvType(train_env_cfg.get("env_type", "")) in (
+            SupportedEnvType.MANISKILL_RLT,
+            SupportedEnvType.REAL,
+            SupportedEnvType.REMOTE_SONGLING,
+        )
+    except ValueError:
+        return False
+
+
 def extract_rlt_obs_from_forward_inputs(
     forward_inputs: dict[str, Any],
     *,

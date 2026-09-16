@@ -27,6 +27,8 @@ from rlinf.algorithms.expert import build_expert_model_config
 from rlinf.algorithms.rlt import (
     build_rlt_route,
     predict_rlt_actions,
+    validate_online_transition_stride,
+    validate_rlt_stage2_configs,
 )
 from rlinf.config import SupportedModel
 from rlinf.data.schema.embodied_types import PolicyOutput
@@ -80,6 +82,26 @@ class MultiStepRolloutWorker(Worker):
         self.expert_model = None
         self.rlt_feature_model = None
         self.rlt_route = None
+        self.rlt_action_codec = None
+        self.defer_rlt_actor_activation = bool(
+            self.cfg.rollout.get("defer_actor_activation", False)
+        )
+        activate_at_boundary = bool(
+            self.cfg.rollout.get("activate_actor_at_episode_boundary", False)
+        )
+        if self.defer_rlt_actor_activation != activate_at_boundary:
+            raise ValueError(
+                "rollout.defer_actor_activation and "
+                "rollout.activate_actor_at_episode_boundary must match."
+            )
+        self._candidate_hf_model = None
+        self._candidate_version = None
+        self._rollout_started = False
+        self.rlt_reference_seed_base = (
+            int(self.cfg.rollout.get("rlt_reference_seed", 2026))
+            + int(self._rank) * 1_000_000_000
+        )
+        self.rlt_reference_sample_index = 0
 
         self.total_num_train_envs = (
             cfg.env.train.total_num_envs if self.enable_train else 0
@@ -154,6 +176,27 @@ class MultiStepRolloutWorker(Worker):
             self.cfg, "rollout.rlt_feature_model", default=None
         )
         if rlt_feature_model_config is not None:
+            validate_rlt_stage2_configs(self.model_cfg, rlt_feature_model_config)
+            validate_online_transition_stride(
+                self.cfg.rollout.get(
+                    "transition_stride", self.model_cfg.num_action_chunks
+                ),
+                chunk_len=self.model_cfg.num_action_chunks,
+            )
+            action_codec_cfg = OmegaConf.select(
+                self.cfg, "rollout.rlt_action_codec", default=None
+            )
+            if action_codec_cfg is not None:
+                codec_type = str(action_codec_cfg.get("type", ""))
+                if codec_type != "songling_absolute_qpos":
+                    raise ValueError(
+                        "Unsupported rollout.rlt_action_codec.type " f"{codec_type!r}."
+                    )
+                from rlinf.envs.remote_songling import SonglingActionCodec
+
+                self.rlt_action_codec = SonglingActionCodec.from_config(
+                    action_codec_cfg
+                )
             self.rlt_feature_model = get_model(copy.deepcopy(rlt_feature_model_config))
             self.rlt_feature_model.eval()
             self.rlt_feature_model.requires_grad_(False)
@@ -172,6 +215,18 @@ class MultiStepRolloutWorker(Worker):
                 self.expert_model.load_state_dict(expert_model_dict)
 
         self.hf_model.eval()
+        if self.defer_rlt_actor_activation:
+            if self.rlt_feature_model is None:
+                raise ValueError(
+                    "rollout.defer_actor_activation requires an RLT feature model."
+                )
+            if self.total_num_train_envs != 1:
+                raise ValueError(
+                    "Episode-boundary RLT Actor activation currently requires exactly "
+                    f"one training environment, got {self.total_num_train_envs}."
+                )
+            self._candidate_hf_model = copy.deepcopy(self.hf_model).eval()
+            self._candidate_hf_model.requires_grad_(False)
         if self.expert_model is not None:
             self.expert_model.eval()
         if self.rlt_feature_model is not None:
@@ -563,6 +618,10 @@ class MultiStepRolloutWorker(Worker):
         intervene_requested: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         if self.rlt_feature_model is not None:
+            reference_seed = (
+                self.rlt_reference_seed_base + self.rlt_reference_sample_index
+            )
+            self.rlt_reference_sample_index += 2
             return predict_rlt_actions(
                 policy_model=self.hf_model,
                 feature_model=self.rlt_feature_model,
@@ -574,6 +633,8 @@ class MultiStepRolloutWorker(Worker):
                 rlt_switch_flags=rlt_switch_flags,
                 intervene_requested=intervene_requested,
                 expert_model=self.expert_model,
+                action_codec=self.rlt_action_codec,
+                reference_seed=reference_seed,
             )
         return self.predict(env_obs, mode=mode)
 
@@ -627,6 +688,32 @@ class MultiStepRolloutWorker(Worker):
                 final_values = torch.zeros_like(actions[:, :1], dtype=torch.float32)
         return final_values[:, :1].cpu().contiguous()
 
+    @torch.no_grad()
+    def _activate_candidate_actor(self) -> bool:
+        if self._candidate_hf_model is None or self._candidate_version is None:
+            return False
+        if not hasattr(self.hf_model, "actor") or not hasattr(
+            self._candidate_hf_model, "actor"
+        ):
+            raise RuntimeError("Deferred RLT weight sync requires an Actor module.")
+        for parameter in self._candidate_hf_model.actor.parameters():
+            if not torch.isfinite(parameter).all():
+                raise RuntimeError("Candidate RLT Actor contains non-finite parameters.")
+        self.hf_model.actor.load_state_dict(self._candidate_hf_model.actor.state_dict())
+        self.version = int(self._candidate_version)
+        self._candidate_version = None
+        if hasattr(self.hf_model, "set_global_step"):
+            self.hf_model.set_global_step(self.version)
+        return True
+
+    def _activate_candidate_at_boundary(self, env_output: dict[str, Any]) -> None:
+        if not self.defer_rlt_actor_activation:
+            return
+        boundary = env_output.get("episode_boundary", None)
+        if boundary is not None and bool(torch.as_tensor(boundary).bool().all()):
+            self._activate_candidate_actor()
+        self._rollout_started = True
+
     @Worker.timer("sync_model_from_actor")
     async def sync_model_from_actor(self):
         """Sync model parameters from the actor worker."""
@@ -656,20 +743,32 @@ class MultiStepRolloutWorker(Worker):
                     options=self._sync_weight_comm_options,
                 ).async_wait()
 
+        receiver_model = (
+            self._candidate_hf_model
+            if self.defer_rlt_actor_activation
+            else self.hf_model
+        )
         if not self.weight_syncer.receiver_initialized():
             await self.weight_syncer.init_receiver(
-                state_dict=self.hf_model.state_dict(),
+                state_dict=receiver_model.state_dict(),
                 recv=recv_func,
                 send=send_func,
             )
 
-        applied_version = await self.weight_syncer.apply(self.hf_model, recv_func)
-        self.version = applied_version
+        applied_version = await self.weight_syncer.apply(receiver_model, recv_func)
+        if self.defer_rlt_actor_activation:
+            self._candidate_version = applied_version
+            if not self._rollout_started:
+                self._activate_candidate_actor()
+        else:
+            self.version = applied_version
         if self.finished_episodes is None:
             self.finished_episodes = (
                 self.version * self.total_num_train_envs * self.rollout_epoch
             )
-        if hasattr(self.hf_model, "set_global_step"):
+        if not self.defer_rlt_actor_activation and hasattr(
+            self.hf_model, "set_global_step"
+        ):
             self.hf_model.set_global_step(applied_version)
 
         gc.collect()
@@ -690,6 +789,7 @@ class MultiStepRolloutWorker(Worker):
                     merge_fn=self._merge_obs_batches,
                     infer_batch_size_fn=self._infer_env_batch_size,
                 ).async_wait()
+                self._activate_candidate_at_boundary(env_output)
                 actions, result = self._predict_rollout_actions(
                     env_output["obs"],
                     final_obs=env_output.get("final_obs", None),
@@ -741,6 +841,7 @@ class MultiStepRolloutWorker(Worker):
                 )
                 continue
 
+            self._activate_candidate_at_boundary(env_output)
             actions, result = self._predict_rollout_actions(
                 env_output["obs"],
                 final_obs=env_output.get("final_obs", None),
@@ -802,6 +903,9 @@ class MultiStepRolloutWorker(Worker):
 
     @Worker.timer("evaluate")
     async def evaluate(self, input_channel: Channel, output_channel: Channel):
+        if self.defer_rlt_actor_activation:
+            self._activate_candidate_actor()
+            self._rollout_started = True
         if self.enable_offload:
             self.reload_model()
         if self.env_decoupled_mode:

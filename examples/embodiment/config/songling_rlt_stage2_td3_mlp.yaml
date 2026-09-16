@@ -1,0 +1,289 @@
+defaults:
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - weight_syncer/patch_syncer@weight_syncer
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor: 0-0
+    env: 0-0
+    rollout: 0-0
+
+runner:
+  task_type: embodied
+  logger:
+    log_path: ../results
+    project_name: rlinf-rlt
+    experiment_name: songling_rlt_stage2_td3_mlp
+    logger_backends: [tensorboard]
+  max_epochs: 8000
+  max_steps: -1
+  only_eval: false
+  weight_sync_interval: 1
+  val_check_interval: -1
+  save_interval: 50
+  resume_dir: null
+  ckpt_path: null
+
+algorithm:
+  # Five critic updates per newly added transition: 5 / 1 = UTD 5.
+  update_epoch: 5
+  rlt_schedule:
+    enable: true
+    max_updates_per_train_step: 400
+    warmup_min_size: 1000
+    warmup_post_collect_updates: 5000
+    train_every_episodes: 0
+    train_every_transitions: 1
+  group_size: 1
+  adv_type: rlt_td3
+  loss_type: rlt_td3
+  loss_agg_func: token-mean
+  agg_q: min
+  actor_agg_q: q1
+  enable_drq: false
+  q_head_type: ${actor.model.q_head_type}
+  bootstrap_type: standard
+  gamma: 0.99
+  tau: 0.005
+
+  q_weight: 1.0
+  bc_weight: 1.0
+  actor_update_action_noise: true
+  target_action_noise: true
+  reference_dropout_prob: 0.5
+  actor_weight_schedule:
+    enable: true
+    warmup_updates: 5000
+    ramp_updates: 20000
+    warmup_bc_weight: 7.0
+    warmup_q_weight: 0.05
+    online_bc_weight: 2.8
+    online_q_weight: 0.50
+
+  entropy_tuning:
+    alpha_type: fixed_alpha
+    initial_alpha: 0.0
+    optim:
+      lr: 1.0e-4
+      lr_scheduler: torch_constant
+      clip_grad: 10.0
+
+  replay_buffer:
+    enable_cache: true
+    cache_size: 5000
+    sample_window_size: 50000
+    max_num_samples: 50000
+    min_buffer_size: 1000
+    auto_save: false
+
+  target_update_freq: 1
+  # The worker samples next actions from the current Actor; only target Q
+  # parameters are consumed for TD bootstrap.
+  target_update_type: q_head_only
+  train_actor_steps: 1000
+  critic_actor_ratio: 2
+  critic_subsample_size: 0
+  backup_entropy: false
+
+env:
+  group_name: EnvGroup
+  train: &songling_env
+    env_type: remote_songling
+    total_num_envs: 1
+    rollout_epoch: 1
+    seed: 2026
+    auto_reset: false
+    ignore_terminations: false
+    use_fixed_reset_state_ids: false
+    group_size: 1
+    reward_mode: raw
+    max_episode_steps: 500
+    max_steps_per_rollout_epoch: 500
+    action_dim: 14
+    num_action_chunks: 10
+    ref_num_action_chunks: 10
+    action_frequency_hz: ${oc.env:SONGLING_ACTION_FREQUENCY_HZ}
+    action_units: ${oc.env:SONGLING_ACTION_UNITS}
+    max_chunk_len: 10
+    critical_phase_default: true
+    task_description: ${oc.env:SONGLING_TASK_PROMPT,fold clothes}
+    image_shape: ${oc.env:SONGLING_IMAGE_SHAPE}
+    rpc:
+      endpoint: ${oc.env:SONGLING_ENV_RPC_ENDPOINT}
+      protocol_version: songling-env-v1
+      connect_timeout_s: 10.0
+      request_timeout_s: 30.0
+      max_message_bytes: 67108864
+    action_codec: &songling_action_codec
+      action_low: ${oc.env:SONGLING_ACTION_LOW}
+      action_high: ${oc.env:SONGLING_ACTION_HIGH}
+    joint_order:
+      - left_joint_1
+      - left_joint_2
+      - left_joint_3
+      - left_joint_4
+      - left_joint_5
+      - left_joint_6
+      - left_gripper
+      - right_joint_1
+      - right_joint_2
+      - right_joint_3
+      - right_joint_4
+      - right_joint_5
+      - right_joint_6
+      - right_gripper
+    head_camera_key: head_camera
+    left_camera_key: left_camera
+    right_camera_key: right_camera
+    video_cfg:
+      save_video: false
+      fps: 10
+      record_every: 1
+      video_base_dir: ${runner.logger.log_path}/video/train
+  eval:
+    <<: *songling_env
+    rollout_epoch: 1
+    video_cfg:
+      save_video: false
+      fps: 10
+      record_every: 1
+      video_base_dir: ${runner.logger.log_path}/video/eval
+
+rollout:
+  group_name: RolloutGroup
+  backend: huggingface
+  enable_offload: false
+  pipeline_stage_num: 1
+  collect_transitions: true
+  collect_prev_infos: false
+  rlt_reference_seed: 2026
+  # Online receives only the post-chunk RLT state; offline preprocessing defaults to stride 2.
+  transition_stride: 10
+  defer_actor_activation: true
+  activate_actor_at_episode_boundary: true
+
+  model:
+    model_type: ${actor.model.model_type}
+    model_path: ""
+    precision: ${actor.model.precision}
+    policy_setup: ${actor.model.policy_setup}
+    action_dim: ${actor.model.action_dim}
+    num_action_chunks: ${actor.model.num_action_chunks}
+    ref_num_action_chunks: ${actor.model.ref_num_action_chunks}
+    z_dim: ${actor.model.z_dim}
+    proprio_dim: ${actor.model.proprio_dim}
+    add_q_head: ${actor.model.add_q_head}
+    q_head_type: ${actor.model.q_head_type}
+    mlp_hidden_dim: ${actor.model.mlp_hidden_dim}
+    mlp_num_hidden_layers: ${actor.model.mlp_num_hidden_layers}
+    actor_noise_sigma: ${actor.model.actor_noise_sigma}
+    ref_action_dropout: ${actor.model.ref_action_dropout}
+    is_lora: false
+
+  rlt_action_codec:
+    type: songling_absolute_qpos
+    action_low: ${env.train.action_codec.action_low}
+    action_high: ${env.train.action_codec.action_high}
+
+  # Full Stage1 wrapper checkpoint containing model.* and rlt_module.*.
+  rlt_feature_model:
+    model_type: openpi_rlinf
+    model_path: ${oc.env:SONGLING_RLT_STAGE1_CHECKPOINT}
+    precision: bf16
+    num_action_chunks: 10
+    action_dim: 14
+    num_steps: 5
+    add_value_head: false
+    is_lora: false
+    openpi_data:
+      repo_id: songling/all_tasks
+      default_prompt: ${env.train.task_description}
+    openpi:
+      task: eval
+      config_name: pi05_rlt_songling_all
+      num_images_in_input: 3
+      action_chunk: 10
+      action_horizon: 10
+      action_env_dim: 14
+      num_steps: 5
+      model_action_dim: 32
+      paligemma_variant: gemma_2b
+      action_expert_variant: gemma_300m
+      max_token_len: 200
+      discrete_state_input: true
+      train_expert_only: false
+      add_value_head: false
+      detach_critic_input: true
+      use_rlt: true
+      rlt_alpha: 1.0
+      rlt_input_dim: 2048
+      rlt_embed_dim: 2048
+      rlt_prefix_seq_len: 1024
+      rlt_num_layers: 2
+      rlt_num_heads: 8
+      rlt_mlp_ratio: 4.0
+      rlt_encoder_type: append_self_attention
+      rlt_image_only: false
+      rlt_use_mask: true
+
+  enable_torch_compile: false
+  enable_cuda_graph: false
+
+actor:
+  group_name: ActorGroup
+  training_backend: fsdp
+  micro_batch_size: 128
+  global_batch_size: 256
+  seed: 1234
+  enable_offload: false
+  model:
+    model_type: rlt_td3_mlp_policy
+    precision: fp32
+    policy_setup: songling-absolute-qpos
+    z_dim: 2048
+    proprio_dim: 14
+    action_dim: 14
+    num_action_chunks: 10
+    ref_num_action_chunks: 10
+    add_value_head: false
+    add_q_head: true
+    q_head_type: default
+    mlp_hidden_dim: 256
+    mlp_num_hidden_layers: 2
+    actor_noise_sigma: 0.1
+    ref_action_dropout: 0.5
+    is_lora: false
+  optim:
+    clip_grad: 10.0
+    lr: 1.0e-4
+    lr_scheduler: torch_constant
+  critic_optim:
+    clip_grad: 10.0
+    lr: 1.0e-4
+    lr_scheduler: torch_constant
+  fsdp_config:
+    strategy: fsdp
+    sharding_strategy: no_shard
+    wrap_policy:
+      module_classes_to_wrap:
+        - TwinQCritic
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: false
+
+critic:
+  use_critic_model: false

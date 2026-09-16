@@ -53,10 +53,14 @@ def main(cfg) -> None:
         from rlinf.workers.actor.fsdp_iql_policy_worker import EmbodiedIQLFSDPPolicy
 
         actor_worker_cls = EmbodiedIQLFSDPPolicy
+    elif cfg.algorithm.loss_type == "rlt_td3":
+        from rlinf.workers.actor.fsdp_rlt_td3_policy_worker import RLTTD3FSDPPolicy
+
+        actor_worker_cls = RLTTD3FSDPPolicy
     else:
         raise NotImplementedError(
             f"Unsupported offline algorithm.loss_type={cfg.algorithm.loss_type!r}. "
-            "Current train_offline_rl entry only supports 'offline_iql'."
+            "Supported values are 'offline_iql' and 'rlt_td3'."
         )
     actor_group = actor_worker_cls.create_group(cfg).launch(
         cluster, name=cfg.actor.group_name, placement_strategy=actor_placement
