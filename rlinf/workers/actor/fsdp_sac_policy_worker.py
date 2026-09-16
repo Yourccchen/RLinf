@@ -47,6 +47,12 @@ from rlinf.utils.utils import clear_memory, collect_param_names_need_sync
 from rlinf.workers.actor.embodied_fsdp_actor_worker import EmbodiedFSDPActor
 
 
+def should_update_actor(update_step: int, interval: int) -> bool:
+    if int(interval) <= 0:
+        raise ValueError("critic_actor_ratio must be positive.")
+    return (int(update_step) + 1) % int(interval) == 0
+
+
 class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
@@ -611,7 +617,9 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             **all_critic_metrics,
         }
 
-        if self.update_step % self.critic_actor_ratio == 0 and train_actor:
+        if should_update_actor(
+            self.update_step, self.critic_actor_ratio
+        ) and train_actor:
             self.optimizer.zero_grad()
             gbs_actor_loss = []
             gbs_entropy = []

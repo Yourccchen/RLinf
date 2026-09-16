@@ -38,7 +38,10 @@ from rlinf.utils.utils import clear_memory
 from rlinf.workers.actor.async_fsdp_sac_policy_worker import (
     AsyncEmbodiedSACFSDPPolicy,
 )
-from rlinf.workers.actor.fsdp_sac_policy_worker import EmbodiedSACFSDPPolicy
+from rlinf.workers.actor.fsdp_sac_policy_worker import (
+    EmbodiedSACFSDPPolicy,
+    should_update_actor,
+)
 
 
 class RLTACLossMixin:
@@ -1021,7 +1024,9 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
         critic_updates_run = 0
         actor_updates_run = 0
         for _ in range(updates_to_run):
-            update_actor = int(self.update_step) % int(self.critic_actor_ratio) == 0
+            update_actor = should_update_actor(
+                self.update_step, self.critic_actor_ratio
+            )
             metrics_data = self.update_one_epoch(train_actor=True)
             append_to_dict(metrics, metrics_data)
             self.update_step += 1

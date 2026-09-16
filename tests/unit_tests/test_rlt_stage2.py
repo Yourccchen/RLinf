@@ -19,6 +19,7 @@ from rlinf.models.embodiment.openpi_rlinf.eval_action_model import (
     OpenPiPytorchEvalActionModel,
 )
 from rlinf.workers.actor.fsdp_rlt_td3_policy_worker import RLTTD3LossMixin
+from rlinf.workers.actor.fsdp_sac_policy_worker import should_update_actor
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
 
@@ -471,3 +472,9 @@ def test_rlt_rollout_payload_marks_reset_and_completed_episode_boundaries():
 
     assert regular["episode_boundary"].tolist() == [False, True]
     assert reset["episode_boundary"].tolist() == [True, True]
+
+
+def test_td3_actor_updates_after_every_second_critic_step():
+    assert [should_update_actor(step, 2) for step in range(6)] == [
+        False, True, False, True, False, True
+    ]

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 from typing import Any, Literal
 
 import numpy as np
@@ -19,6 +20,7 @@ import torch
 
 from rlinf.algorithms.rlt.route import RLTRoute, RLTRouteContext
 from rlinf.algorithms.rlt.transition import RLT_OBS_KEYS, RLT_TRANSITION_PREFIX
+from rlinf.serving.sseval_contract import DualActionCandidates
 
 
 def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
@@ -181,6 +183,68 @@ def validate_rlt_stage2_configs(policy_cfg: Any, feature_cfg: Any) -> None:
             "rollout.rlt_feature_model.openpi.task must be 'eval' for frozen "
             f"Stage1 extraction, got {task!r}."
         )
+
+
+@torch.no_grad()
+def predict_rlt_candidates(
+    *,
+    policy_model: Any,
+    feature_model: Any,
+    action_codec: Any,
+    env_obs: dict[str, Any],
+    episode_id: str,
+    chunk_id: int,
+    actor_ready: bool,
+    actor_version: int,
+    reference_seed: int,
+) -> tuple[DualActionCandidates, dict[str, torch.Tensor]]:
+    """Return both physical VLA and Actor chunks without choosing execution mode."""
+    device = next(feature_model.parameters()).device
+    rng = torch.Generator(device=device)
+    rng.manual_seed(int(reference_seed))
+    extracted = feature_model.extract_rlt_obs(env_obs, rng=rng)
+    vla_action = extracted["ref_chunk"]
+    normalized_obs = dict(extracted)
+    normalized_obs["ref_chunk"] = action_codec.encode(vla_action, clip=True)
+    actor_action, _ = policy_model.predict_action_batch(
+        env_obs=normalized_obs, mode="eval", return_obs=True
+    )
+    if isinstance(actor_action, np.ndarray):
+        actor_action = torch.from_numpy(actor_action).to(normalized_obs["z_rl"].device)
+    physical_actor = action_codec.decode(actor_action, clip=True)
+    checkpoint_version = str(
+        getattr(feature_model, "rlt_checkpoint_version", "unknown")
+    )
+    checkpoint_hash = int.from_bytes(
+        hashlib.sha256(checkpoint_version.encode("utf-8")).digest()[:8],
+        byteorder="big",
+        signed=False,
+    ) & ((1 << 63) - 1)
+
+    def first_numpy(value: Any) -> np.ndarray:
+        if torch.is_tensor(value):
+            value = value.detach().to(torch.float32).cpu().numpy()
+        value = np.asarray(value, dtype=np.float32)
+        if value.ndim == 3 and value.shape[0] == 1:
+            value = value[0]
+        return value
+
+    candidates = DualActionCandidates(
+        episode_id=episode_id,
+        chunk_id=chunk_id,
+        vla_action=first_numpy(vla_action),
+        actor_action=first_numpy(physical_actor),
+        actor_ready=actor_ready,
+        actor_version=actor_version,
+        feature_checkpoint_hash=checkpoint_hash,
+        reference_seed=reference_seed,
+    )
+    replay_obs = {
+        key: value.detach().to(torch.float32).cpu()
+        for key, value in normalized_obs.items()
+        if key in RLT_OBS_KEYS
+    }
+    return candidates, replay_obs
 
 
 def _append_rlt_transition_obs(

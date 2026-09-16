@@ -81,3 +81,20 @@ Base: `feat/rlt` at `dcbec901`
 3. Run a health/reset/hold-only hardware smoke test before permitting action chunks.
 
 
+
+## SsEvalPlatform in-process integration
+
+- Added versioned dual-candidate and transition-feedback contracts.
+- Added `SsEvalRLTRuntime` with ordered feedback ingestion, executed-action
+  replay, asynchronous TD3 learning, UTD scheduling, target critics, learner
+  error propagation, checkpoint/resume, and episode-boundary Actor activation.
+- Added RWI `RlinfPolicy` for direct in-process calls; no HTTPClientPolicy or
+  additional WebSocket is used.
+- Added opt-in SEP capability validation, Action metadata forwarding, candidate
+  and executed-action recording, and RLT Mock Policy/Slave modes.
+- Current host is CPU-only. Stage1/GPU Policy launch remains a deployment-host
+  acceptance step; CPU/Fake tests cover contracts and data flow here.
+- Final CPU/Fake verification: RLinf 46 tests, SEP 13 tests, RWI 5 tests;
+  all targeted modules compile and all three repositories pass `git diff --check`.
+- Added optional terminal `slave.step_feedback` -> SEP -> PolicyServer ->
+  `RlinfPolicy.end_episode()` forwarding without changing shared MsgType enums.

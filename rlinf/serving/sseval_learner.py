@@ -1,0 +1,375 @@
+# Copyright 2026 The RLinf Authors.
+
+"""Single-process asynchronous TD3 learner for the RWI Policy integration."""
+
+from __future__ import annotations
+
+import copy
+import queue
+import threading
+from pathlib import Path
+from dataclasses import dataclass
+from typing import Any, Mapping
+
+import torch
+import torch.nn.functional as F
+
+from rlinf.data.schema.embodied_types import Trajectory
+from rlinf.data.storage.replay import TrajectoryReplayBuffer
+from rlinf.models.embodiment.base_policy import ForwardType
+
+
+@dataclass(frozen=True)
+class InProcessLearnerConfig:
+    batch_size: int = 256
+    min_buffer_size: int = 1000
+    replay_capacity: int = 50000
+    utd: int = 5
+    gamma: float = 0.99
+    tau: float = 0.005
+    actor_update_interval: int = 2
+    actor_lr: float = 1.0e-4
+    critic_lr: float = 1.0e-4
+    actor_clip_grad: float = 10.0
+    critic_clip_grad: float = 10.0
+    reference_dropout_prob: float = 0.5
+    target_action_noise: bool = True
+    actor_update_action_noise: bool = True
+    warmup_updates: int = 5000
+    warmup_bc_weight: float = 7.0
+    warmup_q_weight: float = 0.05
+    online_bc_weight: float = 2.8
+    online_q_weight: float = 0.5
+    ramp_updates: int = 20000
+    queue_size: int = 1024
+    seed: int = 1234
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any] | None):
+        value = dict(value or {})
+        known = cls.__dataclass_fields__
+        unknown = sorted(set(value) - set(known))
+        if unknown:
+            raise ValueError(f"Unknown SsEval learner settings: {unknown}")
+        result = cls(**value)
+        for name in (
+            "batch_size",
+            "min_buffer_size",
+            "replay_capacity",
+            "utd",
+            "actor_update_interval",
+            "queue_size",
+        ):
+            if int(getattr(result, name)) <= 0:
+                raise ValueError(f"{name} must be positive.")
+        return result
+
+
+def _to_device(value: Any, device: torch.device):
+    if torch.is_tensor(value):
+        return value.to(device)
+    if isinstance(value, dict):
+        return {key: _to_device(item, device) for key, item in value.items()}
+    return value
+
+
+class InProcessRLTTD3Learner:
+    """Owns train/target models; publishes immutable Actor snapshots."""
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        config: InProcessLearnerConfig | Mapping[str, Any] | None = None,
+        *,
+        start_background: bool = True,
+    ) -> None:
+        self.config = (
+            config
+            if isinstance(config, InProcessLearnerConfig)
+            else InProcessLearnerConfig.from_mapping(config)
+        )
+        self.model = model
+        self.device = next(model.parameters()).device
+        self.target_model = copy.deepcopy(model).requires_grad_(False).eval()
+        self.actor_optimizer = torch.optim.Adam(
+            self.model.actor.parameters(), lr=self.config.actor_lr
+        )
+        self.critic_optimizer = torch.optim.Adam(
+            self.model.q_head.parameters(), lr=self.config.critic_lr
+        )
+        self.replay = TrajectoryReplayBuffer(
+            seed=self.config.seed,
+            enable_cache=True,
+            cache_size=min(self.config.replay_capacity, 5000),
+            sample_window_size=self.config.replay_capacity,
+            max_num_samples=self.config.replay_capacity,
+            auto_save=False,
+        )
+        self.update_step = 0
+        self.total_transitions = 0
+        self._queue: queue.Queue[Trajectory | None] = queue.Queue(
+            maxsize=self.config.queue_size
+        )
+        self._candidate_lock = threading.Lock()
+        self._train_lock = threading.RLock()
+        self._background_error: BaseException | None = None
+        self._candidate_actor_state: dict[str, torch.Tensor] | None = None
+        self._candidate_version: int | None = None
+        self._last_metrics: dict[str, float] = {}
+        self._closed = False
+        self._thread: threading.Thread | None = None
+        if start_background:
+            self._thread = threading.Thread(
+                target=self._run, name="sseval-rlt-learner", daemon=True
+            )
+            self._thread.start()
+
+    @property
+    def actor_ready(self) -> bool:
+        return self.update_step >= self.config.warmup_updates
+
+    @property
+    def last_metrics(self) -> dict[str, float]:
+        return dict(self._last_metrics)
+
+    def raise_if_failed(self) -> None:
+        if self._background_error is not None:
+            raise RuntimeError("SsEval RLT learner failed.") from self._background_error
+
+    def submit(self, trajectory: Trajectory) -> None:
+        self.raise_if_failed()
+        if self._closed:
+            raise RuntimeError("SsEval RLT learner is closed.")
+        try:
+            self._queue.put_nowait(trajectory)
+        except queue.Full as exc:
+            raise RuntimeError(
+                "SsEval RLT learner queue is full; refusing to drop transition."
+            ) from exc
+
+    def _run(self) -> None:
+        while True:
+            trajectory = self._queue.get()
+            try:
+                if trajectory is None:
+                    return
+                self.add_and_train(trajectory)
+            except BaseException as exc:
+                self._background_error = exc
+                return
+            finally:
+                self._queue.task_done()
+
+    def add_and_train(self, trajectory: Trajectory) -> None:
+        with self._train_lock:
+            self.replay.add_trajectories([trajectory])
+            self.total_transitions += int(trajectory.rewards.shape[0])
+            if self.replay.total_samples < self.config.min_buffer_size:
+                return
+            for _ in range(self.config.utd):
+                self.train_once()
+
+    def _objective_weights(self) -> tuple[float, float]:
+        cfg = self.config
+        if self.update_step < cfg.warmup_updates:
+            return cfg.warmup_bc_weight, cfg.warmup_q_weight
+        if cfg.ramp_updates <= 0:
+            return cfg.online_bc_weight, cfg.online_q_weight
+        progress = min(
+            max((self.update_step - cfg.warmup_updates + 1) / cfg.ramp_updates, 0.0),
+            1.0,
+        )
+        bc = cfg.warmup_bc_weight + progress * (
+            cfg.online_bc_weight - cfg.warmup_bc_weight
+        )
+        q = cfg.warmup_q_weight + progress * (cfg.online_q_weight - cfg.warmup_q_weight)
+        return bc, q
+
+    def train_once(self) -> dict[str, float]:
+        batch = _to_device(self.replay.sample(self.config.batch_size), self.device)
+        rewards = batch["rewards"].reshape(self.config.batch_size, -1).float()
+        valid = batch["forward_inputs"]["valid_step_mask"].reshape_as(rewards).bool()
+        steps = torch.arange(rewards.shape[-1], device=self.device, dtype=rewards.dtype)
+        discounts = torch.pow(
+            torch.as_tensor(self.config.gamma, device=self.device), steps
+        )
+        discounted_reward = (rewards * valid * discounts).sum(dim=-1, keepdim=True)
+        done = (
+            (batch["terminations"].reshape_as(valid).bool())
+            | (batch["truncations"].reshape_as(valid).bool())
+        ) & valid
+        bootstrap = (~done.any(dim=-1, keepdim=True)) & valid.all(dim=-1, keepdim=True)
+
+        with torch.no_grad():
+            next_action, _, _ = self.model(
+                forward_type=ForwardType.SAC,
+                obs=batch["next_obs"],
+                apply_reference_dropout=False,
+                apply_action_noise=self.config.target_action_noise,
+            )
+            next_q = (
+                self.target_model(
+                    forward_type=ForwardType.SAC_Q,
+                    obs=batch["next_obs"],
+                    actions=next_action,
+                )
+                .min(dim=-1, keepdim=True)
+                .values
+            )
+            target_q = (
+                discounted_reward
+                + (self.config.gamma ** rewards.shape[-1]) * bootstrap.float() * next_q
+            )
+
+        q_values = self.model(
+            forward_type=ForwardType.SAC_Q,
+            obs=batch["curr_obs"],
+            actions=batch["actions"],
+        )
+        critic_loss = F.mse_loss(q_values, target_q.expand_as(q_values))
+        self.critic_optimizer.zero_grad(set_to_none=True)
+        critic_loss.backward()
+        critic_norm = torch.nn.utils.clip_grad_norm_(
+            self.model.q_head.parameters(), self.config.critic_clip_grad
+        )
+        self.critic_optimizer.step()
+
+        actor_loss_value = float("nan")
+        actor_updated = (self.update_step + 1) % self.config.actor_update_interval == 0
+        if actor_updated:
+            predicted, _, _ = self.model(
+                forward_type=ForwardType.SAC,
+                obs=batch["curr_obs"],
+                apply_reference_dropout=self.config.reference_dropout_prob > 0,
+                reference_dropout_prob=self.config.reference_dropout_prob,
+                apply_action_noise=self.config.actor_update_action_noise,
+            )
+            q1 = self.model(
+                forward_type=ForwardType.SAC_Q,
+                obs=batch["curr_obs"],
+                actions=predicted,
+                detach_encoder=True,
+            )[..., :1]
+            chunk_len = rewards.shape[-1]
+            action_dim = predicted.shape[-1] // chunk_len
+            predicted_chunk = predicted.reshape(-1, chunk_len, action_dim)
+            executed_chunk = batch["actions"].reshape_as(predicted_chunk)
+            ref_chunk = batch["curr_obs"]["ref_chunk"].reshape(
+                -1, chunk_len, action_dim
+            )
+            intervene = batch["intervene_flags"].reshape(-1, chunk_len).bool()
+            target = torch.where(intervene[..., None], executed_chunk, ref_chunk)
+            bc_error = (predicted_chunk - target).square().mean(dim=-1)
+            bc_loss = (bc_error * valid).sum() / valid.sum().clamp_min(1)
+            bc_weight, q_weight = self._objective_weights()
+            actor_loss = bc_weight * bc_loss - q_weight * q1.mean()
+            self.actor_optimizer.zero_grad(set_to_none=True)
+            self.critic_optimizer.zero_grad(set_to_none=True)
+            actor_loss.backward()
+            actor_norm = torch.nn.utils.clip_grad_norm_(
+                self.model.actor.parameters(), self.config.actor_clip_grad
+            )
+            self.actor_optimizer.step()
+            actor_loss_value = float(actor_loss.detach().cpu())
+            self._publish_candidate(self.update_step + 1)
+        else:
+            actor_norm = torch.zeros(())
+
+        self._soft_update_target_critics()
+        self.update_step += 1
+        self._last_metrics = {
+            "critic_loss": float(critic_loss.detach().cpu()),
+            "critic_grad_norm": float(critic_norm.detach().cpu()),
+            "actor_loss": actor_loss_value,
+            "actor_grad_norm": float(actor_norm.detach().cpu()),
+            "actor_updated": float(actor_updated),
+            "update_step": float(self.update_step),
+            "replay_size": float(self.replay.total_samples),
+        }
+        return dict(self._last_metrics)
+
+    @torch.no_grad()
+    def _soft_update_target_critics(self) -> None:
+        for target, source in zip(
+            self.target_model.q_head.parameters(), self.model.q_head.parameters()
+        ):
+            target.mul_(1.0 - self.config.tau).add_(source, alpha=self.config.tau)
+
+    def _publish_candidate(self, version: int) -> None:
+        snapshot = {
+            key: value.detach().cpu().clone()
+            for key, value in self.model.actor.state_dict().items()
+        }
+        with self._candidate_lock:
+            self._candidate_actor_state = snapshot
+            self._candidate_version = int(version)
+
+    def take_candidate(self) -> tuple[int, dict[str, torch.Tensor]] | None:
+        with self._candidate_lock:
+            if self._candidate_actor_state is None or self._candidate_version is None:
+                return None
+            result = self._candidate_version, self._candidate_actor_state
+            self._candidate_actor_state = None
+            self._candidate_version = None
+            return result
+
+    def wait_idle(self) -> None:
+        self.raise_if_failed()
+        self._queue.join()
+        self.raise_if_failed()
+
+    def save_checkpoint(self, path: str | Path) -> None:
+        self.wait_idle()
+        root = Path(path)
+        root.mkdir(parents=True, exist_ok=True)
+        with self._train_lock:
+            torch.save(
+                {
+                    "model": self.model.state_dict(),
+                    "target_model": self.target_model.state_dict(),
+                    "actor_optimizer": self.actor_optimizer.state_dict(),
+                    "critic_optimizer": self.critic_optimizer.state_dict(),
+                    "update_step": self.update_step,
+                    "total_transitions": self.total_transitions,
+                    "torch_rng_state": torch.random.get_rng_state(),
+                    "cuda_rng_state_all": (
+                        torch.cuda.get_rng_state_all()
+                        if torch.cuda.is_available()
+                        else None
+                    ),
+                },
+                root / "learner.pt",
+            )
+            self.replay.save_checkpoint(str(root / "replay"))
+
+    def load_checkpoint(self, path: str | Path) -> None:
+        self.wait_idle()
+        root = Path(path)
+        state = torch.load(
+            root / "learner.pt", map_location=self.device, weights_only=False
+        )
+        with self._train_lock:
+            self.model.load_state_dict(state["model"], strict=True)
+            self.target_model.load_state_dict(state["target_model"], strict=True)
+            self.actor_optimizer.load_state_dict(state["actor_optimizer"])
+            self.critic_optimizer.load_state_dict(state["critic_optimizer"])
+            self.update_step = int(state["update_step"])
+            self.total_transitions = int(state["total_transitions"])
+            torch.random.set_rng_state(state["torch_rng_state"].cpu())
+            cuda_state = state.get("cuda_rng_state_all")
+            if torch.cuda.is_available() and cuda_state is not None:
+                torch.cuda.set_rng_state_all(cuda_state)
+            self.replay.clear()
+            self.replay.load_checkpoint(str(root / "replay"))
+            self._publish_candidate(self.update_step)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._thread is not None and self._thread.is_alive():
+            self._queue.put(None)
+            self._thread.join(timeout=30.0)
+            if self._thread.is_alive():
+                raise RuntimeError("SsEval RLT learner did not stop within 30 seconds.")
+        self.replay.close()
