@@ -15,6 +15,8 @@
 import os
 import re
 
+CHECKPOINT_COMMIT_MARKER = "COMMITTED"
+
 
 def parse_global_step_from_checkpoint_path(
     checkpoint_path: str | os.PathLike[str],
@@ -38,3 +40,25 @@ def parse_global_step_from_checkpoint_path(
             f"but got {os.fspath(checkpoint_path)!r}."
         )
     return int(match.group(1))
+
+
+def write_checkpoint_commit_marker(checkpoint_dir: str | os.PathLike[str]) -> None:
+    """Mark ``checkpoint_dir`` as fully written.
+
+    The OSS sidecar uploads a step only after this file exists, so a
+    partial DCP tree is never copied. The write is atomic via rename.
+    """
+    directory = os.fspath(checkpoint_dir)
+    os.makedirs(directory, exist_ok=True)
+    marker_path = os.path.join(directory, CHECKPOINT_COMMIT_MARKER)
+    tmp_path = f"{marker_path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        handle.write("ok\n")
+    os.replace(tmp_path, marker_path)
+
+
+def is_committed_checkpoint(checkpoint_dir: str | os.PathLike[str]) -> bool:
+    """Return whether ``checkpoint_dir`` has a commit marker."""
+    return os.path.isfile(
+        os.path.join(os.fspath(checkpoint_dir), CHECKPOINT_COMMIT_MARKER)
+    )

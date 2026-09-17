@@ -290,3 +290,197 @@ def test_interrupted_dataloader_save_does_not_publish_completion(tmp_path, monke
     assert not final_path.exists()
     assert not Path(f"{final_path}.tmp").exists()
     assert not runner._is_complete_checkpoint(str(checkpoint))
+
+
+def test_write_checkpoint_commit_marker_is_atomic(tmp_path):
+    checkpoint_utils = _load_checkpoint_utils()
+    checkpoint_dir = tmp_path / "checkpoints" / "global_step_8"
+    checkpoint_dir.mkdir(parents=True)
+
+    checkpoint_utils.write_checkpoint_commit_marker(checkpoint_dir)
+
+    marker = checkpoint_dir / checkpoint_utils.CHECKPOINT_COMMIT_MARKER
+    assert marker.read_text(encoding="utf-8") == "ok\n"
+    assert not Path(f"{marker}.tmp").exists()
+    assert checkpoint_utils.is_committed_checkpoint(checkpoint_dir)
+    assert not checkpoint_utils.is_committed_checkpoint(tmp_path)
+
+
+def test_sft_save_checkpoint_writes_commit_marker_after_actor_save(tmp_path):
+    from rlinf.runners.sft_runner import SFTRunner
+
+    runner = SimpleNamespace(
+        cfg=OmegaConf.create(
+            {
+                "runner": {
+                    "logger": {
+                        "log_path": str(tmp_path),
+                        "experiment_name": "exp",
+                    }
+                }
+            }
+        ),
+        global_step=8,
+        actor=_Actor(),
+        early_stop=None,
+    )
+
+    SFTRunner._save_checkpoint(runner)
+
+    checkpoint = tmp_path / "exp" / "checkpoints" / "global_step_8"
+    assert (checkpoint / "actor").is_dir()
+    assert (checkpoint / "COMMITTED").read_text(encoding="utf-8") == "ok\n"
+
+
+def test_sft_save_best_checkpoint_writes_commit_marker(tmp_path):
+    from rlinf.runners.sft_runner import SFTRunner
+
+    runner = SimpleNamespace(
+        cfg=OmegaConf.create(
+            {
+                "runner": {
+                    "logger": {
+                        "log_path": str(tmp_path),
+                        "experiment_name": "exp",
+                    }
+                }
+            }
+        ),
+        global_step=8,
+        actor=_Actor(),
+        early_stop=None,
+    )
+
+    SFTRunner._save_checkpoint(runner, is_best=True)
+
+    checkpoint = tmp_path / "exp" / "checkpoints" / "best_model"
+    assert (checkpoint / "COMMITTED").is_file()
+
+
+def test_sft_loss_log_appends_scalar_metrics(tmp_path):
+    from rlinf.runners.sft_runner import SFTRunner
+
+    loss_log_path = tmp_path / "loss.txt"
+    runner = SimpleNamespace(loss_log_path=str(loss_log_path))
+
+    SFTRunner._write_loss_log(
+        runner,
+        7,
+        {
+            "train/loss": 1.25,
+            "train/grad_norm": torch.tensor(0.5),
+            "metadata": object(),
+        },
+    )
+
+    assert loss_log_path.read_text(encoding="utf-8") == (
+        "Step 7: train/grad_norm=0.5, train/loss=1.25\n"
+    )
+
+
+def _load_oss_ckpt_uploader():
+    module_path = (
+        Path(__file__).resolve().parents[2] / "toolkits" / "oss_ckpt_uploader.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "_rlinf_oss_ckpt_uploader_under_test", module_path
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_oss_ckpt_uploader_parse_oss_uri():
+    uploader = _load_oss_ckpt_uploader()
+
+    assert uploader.parse_oss_uri(
+        "s3://shengshu-base2-test/caimengchen/rlinf_runs/exp"
+    ) == ("shengshu-base2-test", "caimengchen/rlinf_runs/exp")
+    assert uploader.parse_oss_uri("oss://bucket/prefix/run") == ("bucket", "prefix/run")
+    assert uploader.parse_oss_uri("s3+ali://bucket/a/b") == ("bucket", "a/b")
+
+
+@pytest.mark.parametrize(
+    "uri",
+    ["s3://bucket-only", "https://oss.example/bucket/key", ""],
+)
+def test_oss_ckpt_uploader_rejects_invalid_uri(uri):
+    uploader = _load_oss_ckpt_uploader()
+
+    with pytest.raises(ValueError):
+        uploader.parse_oss_uri(uri)
+
+
+def test_oss_ckpt_uploader_lists_committed_dcp_trees(tmp_path):
+    uploader = _load_oss_ckpt_uploader()
+    checkpoints = tmp_path / "checkpoints"
+    ready = checkpoints / "global_step_2500"
+    pending = checkpoints / "global_step_5000"
+    best = checkpoints / "best_model"
+    ignored = checkpoints / "tmp_scratch"
+    for path in (ready, pending, best, ignored):
+        (path / "actor" / "dcp_checkpoint").mkdir(parents=True)
+        (path / "actor" / "dcp_checkpoint" / "shard.pt").write_bytes(b"dcp")
+        (path / "actor" / "model_state_dict").mkdir(parents=True, exist_ok=True)
+        (path / "actor" / "model_state_dict" / "full_weights.pt").write_bytes(b"full")
+    (ready / "COMMITTED").write_text("ok\n")
+    (best / "COMMITTED").write_text("ok\n")
+
+    listed = uploader.committed_checkpoint_dirs(str(tmp_path))
+
+    assert listed == [
+        os.path.join("checkpoints", "best_model"),
+        os.path.join("checkpoints", "global_step_2500"),
+    ]
+    assert uploader.object_key(
+        "bucket/exp", listed[1] + "/actor/dcp_checkpoint/shard.pt"
+    ) == ("bucket/exp/checkpoints/global_step_2500/actor/dcp_checkpoint/shard.pt")
+
+
+def test_oss_ckpt_uploader_waits_for_settle_before_idle(tmp_path):
+    uploader = _load_oss_ckpt_uploader()
+    step_dir = tmp_path / "checkpoints" / "global_step_2500"
+    (step_dir / "actor").mkdir(parents=True)
+    (step_dir / "COMMITTED").write_text("ok\n")
+    committed_at = (step_dir / "COMMITTED").stat().st_mtime
+    relative = os.path.join("checkpoints", "global_step_2500")
+
+    pending, has_unfinished = uploader.select_pending_uploads(
+        str(tmp_path), {}, committed_at + 1, settle_secs=10
+    )
+    assert pending == []
+    assert has_unfinished is True
+
+    pending, has_unfinished = uploader.select_pending_uploads(
+        str(tmp_path), {}, committed_at + 11, settle_secs=10
+    )
+    assert pending == [(relative, committed_at)]
+    assert has_unfinished is True
+
+    pending, has_unfinished = uploader.select_pending_uploads(
+        str(tmp_path), {relative: committed_at}, committed_at + 11, settle_secs=10
+    )
+    assert pending == []
+    assert has_unfinished is False
+
+
+def test_oss_ckpt_uploader_syncs_loss_log(tmp_path):
+    uploader = _load_oss_ckpt_uploader()
+    loss_log = tmp_path / "loss.txt"
+    loss_log.write_text("Step 0: train/loss=1.25\n", encoding="utf-8")
+    uploads = []
+    client = SimpleNamespace(
+        upload_file=lambda source, bucket, destination: uploads.append(
+            (source, bucket, destination)
+        )
+    )
+
+    uploader.sync_run_file(
+        client,
+        "bucket",
+        "runs/experiment",
+        str(tmp_path),
+        "loss.txt",
+    )
+
+    assert uploads == [(str(loss_log), "bucket", "runs/experiment/loss.txt")]

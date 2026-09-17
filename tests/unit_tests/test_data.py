@@ -15,6 +15,7 @@
 """Datasets, batching, and the on-the-wire shapes they produce."""
 
 import copy
+import dataclasses
 import json
 import random
 import time
@@ -694,3 +695,67 @@ def test_infer_obs_batch_size_images_only():
 def test_infer_obs_batch_size_raises_when_unbatched():
     with pytest.raises(ValueError, match="Cannot infer batch size"):
         infer_obs_batch_size({"obs": {}})
+
+
+def test_ario_config_omits_unsupported_default_options():
+    pytest.importorskip("openpi")
+    from rlinf.data.datasets.openpi_rlinf.xingchen.xingchen_sft_data_loader import (
+        _create_ario_config,
+    )
+
+    @dataclasses.dataclass
+    class LegacyArioConfig:
+        s3_prefixes: str
+
+    config = _create_ario_config(
+        LegacyArioConfig,
+        {
+            "s3_prefixes": "s3://bucket/data/",
+            "index_cache_dir": "",
+            "discover_from_data_lake": False,
+            "index_workers": 32,
+        },
+    )
+
+    assert config == LegacyArioConfig(s3_prefixes="s3://bucket/data/")
+
+
+def test_ario_config_rejects_unsupported_enabled_options():
+    pytest.importorskip("openpi")
+    from rlinf.data.datasets.openpi_rlinf.xingchen.xingchen_sft_data_loader import (
+        _create_ario_config,
+    )
+
+    @dataclasses.dataclass
+    class LegacyArioConfig:
+        s3_prefixes: str
+
+    with pytest.raises(RuntimeError, match="index_cache_dir"):
+        _create_ario_config(
+            LegacyArioConfig,
+            {
+                "s3_prefixes": "s3://bucket/data/",
+                "index_cache_dir": "/shared/index",
+            },
+        )
+
+
+def test_xingchen_openpi_data_overrides_come_from_model_config():
+    pytest.importorskip("openpi")
+    from rlinf.data.datasets.openpi_rlinf.xingchen.xingchen_sft_data_loader import (
+        _resolve_openpi_data_kwargs,
+    )
+
+    model_cfg = DictConfig(
+        {
+            "openpi_data": {
+                "repo_id": "songling/bfjm_0915",
+                "norm_stats_path": "/models/songling/bfjm_0915/norm_stats.json",
+            }
+        }
+    )
+
+    assert _resolve_openpi_data_kwargs(model_cfg) == {
+        "repo_id": "songling/bfjm_0915",
+        "norm_stats_path": "/models/songling/bfjm_0915/norm_stats.json",
+    }

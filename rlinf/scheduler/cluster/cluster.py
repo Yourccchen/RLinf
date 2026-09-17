@@ -353,6 +353,7 @@ class Cluster:
             ray.init(**ray_init_kwargs)
         except ConnectionError:
             ray_init_kwargs = {
+                "include_dashboard": False,
                 "logging_level": Cluster.LOGGING_LEVEL,
                 "namespace": Cluster.NAMESPACE,
             }
@@ -467,12 +468,19 @@ class Cluster:
             if self._distributed_log_collector is not None:
                 self._distributed_log_collector.stop()
 
-            with without_http_proxies():
-                alive_actors = list_actors(
-                    filters=[
-                        ("STATE", "=", "ALIVE"),
-                        ("RAY_NAMESPACE", "=", Cluster.NAMESPACE),
-                    ]
+            try:
+                with without_http_proxies():
+                    alive_actors = list_actors(
+                        filters=[
+                            ("STATE", "=", "ALIVE"),
+                            ("RAY_NAMESPACE", "=", Cluster.NAMESPACE),
+                        ]
+                    )
+            except ConnectionError:
+                alive_actors = []
+                self._logger.warning(
+                    "Ray Dashboard is unavailable; skipping actor enumeration "
+                    "during failure cleanup."
                 )
             for actor_state in alive_actors:
                 actor = ray.get_actor(actor_state.name)

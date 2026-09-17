@@ -46,6 +46,11 @@ __all__ = [
 ]
 
 _IMAGE_KEYS = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
+_OPTIONAL_ARIO_CONFIG_DEFAULTS = {
+    "index_cache_dir": "",
+    "discover_from_data_lake": False,
+    "index_workers": 32,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +139,41 @@ class XingchenSftDataConfig:
     max_token_len: int
 
 
+def _create_ario_config(config_cls: type, config_kwargs: dict[str, Any]) -> Any:
+    """Create an ARIO config across supported openpi_Ario versions."""
+    supported_fields = {field.name for field in dataclasses.fields(config_cls)}
+    unsupported_fields = set(config_kwargs) - supported_fields
+    unsupported_required = unsupported_fields - _OPTIONAL_ARIO_CONFIG_DEFAULTS.keys()
+    unsupported_enabled = {
+        name
+        for name in unsupported_fields & _OPTIONAL_ARIO_CONFIG_DEFAULTS.keys()
+        if config_kwargs[name] != _OPTIONAL_ARIO_CONFIG_DEFAULTS[name]
+    }
+    if unsupported_required or unsupported_enabled:
+        names = ", ".join(sorted(unsupported_required | unsupported_enabled))
+        raise RuntimeError(
+            "The installed openpi_Ario ArioConfig does not support configured "
+            f"options: {names}. Update openpi_Ario or disable these options."
+        )
+    return config_cls(
+        **{
+            name: value
+            for name, value in config_kwargs.items()
+            if name in supported_fields
+        }
+    )
+
+
+def _resolve_openpi_data_kwargs(model_cfg: Any) -> dict[str, Any] | None:
+    """Resolve data overrides nested under the actor model config."""
+    data_kwargs = OmegaConf.select(model_cfg, "openpi_data", default=None)
+    if data_kwargs is None:
+        return None
+    return typing.cast(
+        dict[str, Any], OmegaConf.to_container(data_kwargs, resolve=True)
+    )
+
+
 def build_xingchen_sft_dataloader(
     cfg: Any,
     world_size: int,
@@ -147,7 +187,6 @@ def build_xingchen_sft_dataloader(
     Hydra config.  Falls back to ``data.train_data_paths[0].dataset_path`` as
     an S3 URI if ``data.s3_prefixes`` is not set.
     """
-    from rlinf.models.embodiment.openpi.dataconfig import get_openpi_config
     from rlinf.models.embodiment.openpi_rlinf.transforms_pipeline import (
         build_openpi_transforms,
     )
@@ -166,18 +205,25 @@ def build_xingchen_sft_dataloader(
         if prefixes_file:
             lines = [
                 line.strip()
-                for line in pathlib.Path(prefixes_file).read_text(encoding="utf-8").splitlines()
+                for line in pathlib.Path(prefixes_file)
+                .read_text(encoding="utf-8")
+                .splitlines()
                 if line.strip() and not line.startswith("#")
             ]
             if not lines:
-                raise ValueError(f"s3_prefixes_file {prefixes_file!r} contained no prefixes")
+                raise ValueError(
+                    f"s3_prefixes_file {prefixes_file!r} contained no prefixes"
+                )
             s3_prefixes = ",".join(lines)
             logger.info(
-                "Xingchen/Songling SFT: loaded %d prefixes from %s", len(lines), prefixes_file
+                "Xingchen/Songling SFT: loaded %d prefixes from %s",
+                len(lines),
+                prefixes_file,
             )
     if not s3_prefixes:
         # Allow dataset_path to be used as an S3 prefix directly.
         from rlinf.data.storage.lerobot import resolve_lerobot_repo_id
+
         fallback = resolve_lerobot_repo_id(data_paths)
         if fallback and fallback.startswith("s3://"):
             s3_prefixes = fallback
@@ -193,7 +239,9 @@ def build_xingchen_sft_dataloader(
     action_dim: int = int(model_cfg.action_dim)
     max_token_len: int = int(model_cfg.openpi.max_token_len)
     task_prompt: str = str(
-        OmegaConf.select(model_cfg, "openpi_data.default_prompt", default="fold clothes")
+        OmegaConf.select(
+            model_cfg, "openpi_data.default_prompt", default="fold clothes"
+        )
         or "fold clothes"
     )
     video_downsample_rate: int = int(
@@ -254,26 +302,29 @@ def build_xingchen_sft_dataloader(
     # Build the ARIO streaming dataset
     from openpi.datasets.ario_dataset import ArioConfig, ArioStreamingDataset
 
-    ario_cfg = ArioConfig(
-        s3_prefixes=s3_prefixes,
-        s3_endpoint=s3_endpoint,
-        video_downsample_rate=video_downsample_rate,
-        min_frames=min_frames,
-        task=task_prompt,
-        multi_view=True,
-        max_episodes=max_episodes,
-        cache_size=cache_size,
-        disk_cache_dir=disk_cache_dir,
-        disk_cache_max_gb=disk_cache_max_gb,
-        index_cache_dir=index_cache_dir,
-        discover_from_data_lake=discover_from_data_lake,
-        index_workers=index_workers,
-        data_format=data_format,
-        action_start_offset=action_start_offset,
-        filter_episodes_by_state=filter_episodes_by_state,
-        load_instructions=load_instructions,
-        instruction_field=instruction_field,
-        video_reader_cache_size=video_reader_cache_size,
+    ario_cfg = _create_ario_config(
+        ArioConfig,
+        {
+            "s3_prefixes": s3_prefixes,
+            "s3_endpoint": s3_endpoint,
+            "video_downsample_rate": video_downsample_rate,
+            "min_frames": min_frames,
+            "task": task_prompt,
+            "multi_view": True,
+            "max_episodes": max_episodes,
+            "cache_size": cache_size,
+            "disk_cache_dir": disk_cache_dir,
+            "disk_cache_max_gb": disk_cache_max_gb,
+            "index_cache_dir": index_cache_dir,
+            "discover_from_data_lake": discover_from_data_lake,
+            "index_workers": index_workers,
+            "data_format": data_format,
+            "action_start_offset": action_start_offset,
+            "filter_episodes_by_state": filter_episodes_by_state,
+            "load_instructions": load_instructions,
+            "instruction_field": instruction_field,
+            "video_reader_cache_size": video_reader_cache_size,
+        },
     )
     # Build the openpi transform pipeline FIRST. It loads norm stats, which is
     # the cheapest thing that can fail; discovering and indexing the episodes
@@ -281,9 +332,7 @@ def build_xingchen_sft_dataloader(
     # not be discovered only after that work is thrown away.
     config_name = str(model_cfg.openpi.config_name)
     model_path = str(model_cfg.model_path)
-    data_kwargs = OmegaConf.select(cfg.actor, "openpi_data", default=None)
-    if data_kwargs is not None:
-        data_kwargs = OmegaConf.to_container(data_kwargs, resolve=True)
+    data_kwargs = _resolve_openpi_data_kwargs(model_cfg)
 
     input_transforms, _ = build_openpi_transforms(
         model_path,

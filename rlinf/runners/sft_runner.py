@@ -20,7 +20,10 @@ from omegaconf.dictconfig import DictConfig
 from tqdm import tqdm
 
 from rlinf.scheduler import WorkerGroupFuncResult as Handle
-from rlinf.utils.checkpoint import parse_global_step_from_checkpoint_path
+from rlinf.utils.checkpoint import (
+    parse_global_step_from_checkpoint_path,
+    write_checkpoint_commit_marker,
+)
 from rlinf.utils.distributed import ScopedTimer
 from rlinf.utils.metric_logger import MetricLogger
 from rlinf.utils.runner_utils import EarlyStopController, check_progress
@@ -59,6 +62,15 @@ class SFTRunner:
         self.timer = ScopedTimer(reduction="max", sync_cuda=False)
 
         self.metric_logger = MetricLogger(cfg)
+        experiment_dir = os.path.join(
+            self.cfg.runner.logger.log_path,
+            self.cfg.runner.logger.experiment_name,
+        )
+        os.makedirs(experiment_dir, exist_ok=True)
+        self.loss_log_path = os.path.join(experiment_dir, "loss.txt")
+        if self.cfg.runner.get("resume_dir", None) is None:
+            with open(self.loss_log_path, "w", encoding="utf-8"):
+                pass
 
     def init_workers(self) -> None:
         # create worker in order to decrease the maximum memory usage
@@ -137,6 +149,7 @@ class SFTRunner:
 
             logging_metrics = time_metrics
             logging_metrics.update(training_metrics)
+            self._write_loss_log(_step, logging_metrics)
 
             if eval_model:
                 evaluate_metrics = {f"eval/{k}": v for k, v in eval_metrics[0].items()}
@@ -153,6 +166,17 @@ class SFTRunner:
                 f"Early stopping triggered! Best val_acc: {self.early_stop.best_val_acc:.4f}"
             )
         self.metric_logger.finish()
+
+    def _write_loss_log(self, step: int, metrics: dict) -> None:
+        """Append scalar training metrics to the experiment's text log."""
+        formatted_metrics = []
+        for name, value in sorted(metrics.items()):
+            try:
+                formatted_metrics.append(f"{name}={float(value):.6g}")
+            except (TypeError, ValueError):
+                continue
+        with open(self.loss_log_path, "a", encoding="utf-8") as loss_log:
+            loss_log.write(f"Step {step}: {', '.join(formatted_metrics)}\n")
 
     def run_eval(self) -> None:
         with self.timer("evaluate"):
@@ -192,6 +216,7 @@ class SFTRunner:
         actor_save_path = os.path.join(base_output_dir, "actor")
         os.makedirs(actor_save_path, exist_ok=True)
         self.actor.save_checkpoint(actor_save_path, self.global_step).wait()
+        write_checkpoint_commit_marker(base_output_dir)
         if is_best and self.early_stop is not None:
             logger.info(
                 f"Saved best model (val_acc={self.early_stop.best_val_acc:.4f}) to {base_output_dir}"

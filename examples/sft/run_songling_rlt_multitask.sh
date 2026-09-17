@@ -16,6 +16,9 @@
 #
 # Credentials are never stored here: the cluster injects them, or you export
 # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY before launching.
+#
+# Checkpoints stay on VEPfs and are also uploaded (DCP included) to
+# $OSS_RUN_ROOT/<experiment_name>/checkpoints/. Disable with OSS_CKPT_UPLOAD=0.
 
 set -euo pipefail
 
@@ -145,6 +148,11 @@ print(sum(1 for n in ray.nodes() if n['Alive']))
     echo "=== config:  $CONFIG_NAME ==="
     echo "=== repo:    $PROJECT_ROOT ==="
 
+    # shellcheck source=oss_ckpt_sidecar.sh
+    source "$PROJECT_ROOT/examples/sft/oss_ckpt_sidecar.sh"
+    start_oss_ckpt_sidecar
+    trap stop_oss_ckpt_sidecar EXIT
+
     export HYDRA_FULL_ERROR=1
     set +e
     "$PYTHON" "$PROJECT_ROOT/examples/sft/train_vla_sft.py" \
@@ -155,6 +163,9 @@ print(sum(1 for n in ray.nodes() if n['Alive']))
 
     # Release the worker pod whatever happened, so it does not outlive the run.
     touch "$DONE_FILE"
+
+    trap - EXIT
+    drain_oss_ckpt_sidecar
 
     if [[ "$TRAIN_RC" -ne 0 ]] || grep -q "Error executing job" /tmp/rlt_multitask_train.log; then
         echo "=== multitask Stage-1 RLT SFT FAILED (rc=$TRAIN_RC) ===" >&2
