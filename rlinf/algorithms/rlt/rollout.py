@@ -163,13 +163,20 @@ def validate_rlt_stage2_configs(policy_cfg: Any, feature_cfg: Any) -> None:
         }
         expected_repo = expected_repos.get(config_name)
         feature_data = _cfg_get(feature_cfg, "openpi_data", {})
-        actual_repo = str(_cfg_get(feature_data, "repo_id", ""))
+        actual_repo = str(_cfg_get(feature_data, "repo_id", "")).strip()
+        raw_norm_stats_path = _cfg_get(feature_data, "norm_stats_path", None)
+        has_explicit_norm_stats = isinstance(raw_norm_stats_path, str) and bool(
+            raw_norm_stats_path.strip()
+        )
         if expected_repo is None:
             invalid.append(f"unsupported Stage1 config_name {config_name!r}")
-        elif actual_repo != expected_repo:
+        elif not actual_repo:
+            invalid.append("Stage1 openpi_data.repo_id must be non-empty")
+        elif actual_repo != expected_repo and not has_explicit_norm_stats:
             invalid.append(
-                "Stage1 norm-stats repo: expected "
-                f"{expected_repo!r}, got {actual_repo!r}"
+                "Stage1 custom norm-stats repo requires an explicit "
+                f"openpi_data.norm_stats_path: expected {expected_repo!r}, "
+                f"got {actual_repo!r}"
             )
         if invalid:
             raise ValueError(

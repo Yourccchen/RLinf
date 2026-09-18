@@ -19,16 +19,17 @@ feature_model:
   add_value_head: false
   is_lora: false
   openpi_data:
-    repo_id: songling/all_tasks
-    default_prompt: fold clothes
+    repo_id: songling/bfjm_0915
+    default_prompt: build with blocks
+    norm_stats_path: /home/caimengchen/ckpts/songling_bfjm_0915_rlt_stage1_sft_openpi_pi05/norm_stats.json
   openpi:
     task: eval
-    config_name: pi05_rlt_songling_all
+    config_name: pi05_rlt_songling_joint
     num_images_in_input: 3
     action_chunk: 10
     action_horizon: 10
     action_env_dim: 14
-    num_steps: 5
+    num_steps: 10
     model_action_dim: 32
     paligemma_variant: gemma_2b
     action_expert_variant: gemma_300m
@@ -68,8 +69,8 @@ actor_model:
   is_lora: false
 
 learner:
-  batch_size: 256
-  min_buffer_size: 1000
+  batch_size: 64
+  min_buffer_size: 100
   replay_capacity: 50000
   utd: 5
   gamma: 0.99
@@ -82,7 +83,7 @@ learner:
   reference_dropout_prob: 0.5
   target_action_noise: true
   actor_update_action_noise: true
-  warmup_updates: 5000
+  warmup_updates: 500
   warmup_bc_weight: 7.0
   warmup_q_weight: 0.05
   online_bc_weight: 2.8

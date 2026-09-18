@@ -279,6 +279,75 @@ def test_stage1_stage2_config_validation_accepts_songling_contract():
     )
 
 
+def test_stage1_stage2_config_validation_accepts_explicit_custom_norm_stats():
+    validate_rlt_stage2_configs(
+        {
+            "z_dim": 2048,
+            "proprio_dim": 14,
+            "action_dim": 14,
+            "num_action_chunks": 10,
+            "ref_num_action_chunks": 10,
+        },
+        {
+            "action_dim": 14,
+            "num_action_chunks": 10,
+            "openpi_data": {
+                "repo_id": "songling/bfjm_0915",
+                "norm_stats_path": "/models/songling/bfjm_0915/norm_stats.json",
+            },
+            "openpi": {
+                "task": "eval",
+                "config_name": "pi05_rlt_songling_joint",
+                "use_rlt": True,
+                "rlt_embed_dim": 2048,
+                "model_action_dim": 32,
+                "num_images_in_input": 3,
+                "rlt_image_only": False,
+                "rlt_use_mask": True,
+                "rlt_prefix_seq_len": 1024,
+                "rlt_num_layers": 2,
+                "rlt_num_heads": 8,
+                "rlt_encoder_type": "append_self_attention",
+            },
+        },
+    )
+
+
+def test_stage1_stage2_config_validation_rejects_custom_repo_without_norm_stats():
+    policy = {
+        "z_dim": 2048,
+        "proprio_dim": 14,
+        "action_dim": 14,
+        "num_action_chunks": 10,
+        "ref_num_action_chunks": 10,
+    }
+    feature = {
+        "action_dim": 14,
+        "num_action_chunks": 10,
+        "openpi_data": {
+            "repo_id": "songling/bfjm_0915",
+            "norm_stats_path": None,
+        },
+        "openpi": {
+            "task": "eval",
+            "config_name": "pi05_rlt_songling_joint",
+            "use_rlt": True,
+            "rlt_embed_dim": 2048,
+            "model_action_dim": 32,
+            "num_images_in_input": 3,
+            "rlt_image_only": False,
+            "rlt_use_mask": True,
+            "rlt_prefix_seq_len": 1024,
+            "rlt_num_layers": 2,
+            "rlt_num_heads": 8,
+            "rlt_encoder_type": "append_self_attention",
+        },
+    }
+
+    with pytest.raises(ValueError, match="norm_stats_path"):
+        validate_rlt_stage2_configs(policy, feature)
+
+
 def test_stage1_stage2_config_validation_rejects_songling_prefix_semantics():
     policy = {
         "z_dim": 2048,
