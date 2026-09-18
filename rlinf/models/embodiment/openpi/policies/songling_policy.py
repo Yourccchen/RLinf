@@ -19,6 +19,10 @@ by ``ArioStreamingDataset`` (data_format="songling_canonical55"):
 
     qpos_left(6) + gripper_left(1) + qpos_right(6) + gripper_right(1) = 14
 
+``ArioStreamingDataset`` already converts the 12 arm joints from degrees to
+radians on load. Gripper slots stay in raw encoder units. These transforms
+do not convert units again.
+
 Mirrors ``openpi.policies.songling_policy`` so both stacks stay in step.
 """
 
@@ -26,7 +30,6 @@ import dataclasses
 
 import einops
 import numpy as np
-
 from openpi import transforms
 from openpi.models import model as _model
 
@@ -37,7 +40,9 @@ def make_songling_example() -> dict:
     """Create a random Songling policy input example."""
     return {
         "observation/image": np.random.randint(256, size=(240, 320, 3), dtype=np.uint8),
-        "observation/cam_high": np.random.randint(256, size=(240, 320, 3), dtype=np.uint8),
+        "observation/cam_high": np.random.randint(
+            256, size=(240, 320, 3), dtype=np.uint8
+        ),
         "observation/cam_left_wrist": np.random.randint(
             256, size=(240, 320, 3), dtype=np.uint8
         ),

@@ -1,0 +1,138 @@
+defaults:
+  - model/pi0_5_rlinf@actor.model
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: all
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "/mnt/vepfs/world/fanyiming/rlinf_runs"
+    project_name: rlinf-rlt
+    experiment_name: "songling_bfjm_rlt_stage1_sft_openpi_pi05"
+    logger_backends: ["tensorboard"]
+
+  max_epochs: -1
+  max_steps: 60000
+  val_check_interval: -1
+  save_interval: 2500
+
+data:
+  # ARIO episodes are streamed directly from OSS without LeRobot conversion.
+  train_data_paths:
+    - dataset_path: "s3://shengshu-base2-test/caimengchen/Songling/ario-format/Songling/bfjm_0915/"
+      weight: 1.0
+    - dataset_path: "s3://shengshu-base2-test/caimengchen/Songling/ario-format/Songling/bfjm_0916/"
+      weight: 1.0
+    - dataset_path: "s3://shengshu-base2-test/caimengchen/Songling/ario-format/Songling/bfjm_0917/"
+      weight: 1.0
+  # Explicit prefix takes priority over train_data_paths in the ARIO loader.
+  s3_prefixes: "s3://shengshu-base2-test/caimengchen/Songling/ario-format/Songling/bfjm_0915/,s3://shengshu-base2-test/caimengchen/Songling/ario-format/Songling/bfjm_0916/,s3://shengshu-base2-test/caimengchen/Songling/ario-format/Songling/bfjm_0917/"
+  s3_endpoint: "https://oss-cn-wulanchabu-internal.aliyuncs.com"
+  # Songling dual-arm state: left arm 6 + gripper 1 + right arm 6 + gripper 1.
+  data_format: "songling_canonical55"
+  action_start_offset: 1
+  filter_episodes_by_state: True
+  load_instructions: True
+  instruction_field: "instruction_qwen38_max_medium_ch"
+  video_downsample_rate: 1
+  min_frames: 51
+  num_workers: 4
+  cache_size: 32
+  # Keep this at 0: cached decord readers retain decoded frame buffers.
+  video_reader_cache_size: 0
+  disk_cache_dir: "/mnt/vepfs/world/fanyiming/cache/ario_songling_bfjm"
+  disk_cache_max_gb: 200.0
+  # Uncomment for a data and configuration smoke test.
+  # max_episodes: 4
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 1
+  global_batch_size: 64
+  seed: 0
+
+  model:
+    precision: fp32
+    model_path: "/mnt/vepfs/world/fanyiming/models/pi05_base_RLinf"
+    model_type: "openpi_rlinf"
+    num_action_chunks: 50
+    action_dim: 14
+    add_value_head: False
+    num_steps: 5
+    openpi:
+      task: sft
+      config_name: "pi05_rlt_songling_joint"
+      num_images_in_input: 3
+      train_expert_only: False
+      detach_critic_input: True
+      action_horizon: 50
+      action_chunk: ${actor.model.num_action_chunks}
+      action_env_dim: ${actor.model.action_dim}
+      num_steps: ${actor.model.num_steps}
+      model_action_dim: 32
+      paligemma_variant: "gemma_2b"
+      action_expert_variant: "gemma_300m"
+      max_token_len: 200
+      discrete_state_input: True
+      # Joint objective: rlt_loss + rlt_alpha * vla_loss.
+      use_rlt: True
+      rlt_alpha: 1.0
+      rlt_input_dim: 2048
+      rlt_embed_dim: 2048
+      rlt_prefix_seq_len: 1024
+      rlt_num_layers: 2
+      rlt_num_heads: 8
+      rlt_mlp_ratio: 4.0
+      rlt_encoder_type: "append_self_attention"
+      rlt_image_only: False
+      rlt_use_mask: True
+
+    openpi_data:
+      repo_id: "songling/bfjm"
+      # Per-episode sub_instructions are preferred; this is the fallback prompt.
+      default_prompt: "build with blocks"
+      norm_stats_path: "/mnt/vepfs/world/fanyiming/models/pi05_base_RLinf/songling/bfjm/norm_stats.json"
+
+  optim:
+    lr: 2.5e-5
+    value_lr: 1.55e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    weight_decay: 1.0e-10
+    clip_grad: 1.0
+    total_training_steps: 60000
+    lr_warmup_steps: 5000
+    lr_scheduler: "cosine"
+    num_cycles: 0.5
+    min_lr: 2.5e-6
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "full_shard"
+    use_orig_params: False
+    gradient_checkpointing: True
+    mixed_precision:
+      param_dtype: bf16
+      reduce_dtype: fp32
+      buffer_dtype: fp32
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False

@@ -750,6 +750,7 @@ def test_xingchen_openpi_data_overrides_come_from_model_config():
         {
             "openpi_data": {
                 "repo_id": "songling/bfjm_0915",
+                "default_prompt": "build with blocks",
                 "norm_stats_path": "/models/songling/bfjm_0915/norm_stats.json",
             }
         }
@@ -757,5 +758,6 @@ def test_xingchen_openpi_data_overrides_come_from_model_config():
 
     assert _resolve_openpi_data_kwargs(model_cfg) == {
         "repo_id": "songling/bfjm_0915",
+        "default_prompt": "build with blocks",
         "norm_stats_path": "/models/songling/bfjm_0915/norm_stats.json",
     }
