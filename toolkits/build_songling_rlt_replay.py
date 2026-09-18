@@ -50,7 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt", default="fold clothes")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--transition-stride", type=int, default=2)
-    parser.add_argument("--chunk-len", type=int, default=10)
+    parser.add_argument("--chunk-len", type=int, default=50)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--overwrite", action="store_true")

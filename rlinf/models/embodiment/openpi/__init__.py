@@ -47,6 +47,10 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     if override_model_config_kwargs is not None:
         for key, val in override_model_config_kwargs.items():
             actor_model_config.__dict__[key] = val
+    yaml_horizon = getattr(cfg, "num_action_chunks", None)
+    if yaml_horizon is not None:
+        actor_model_config.__dict__["action_horizon"] = int(yaml_horizon)
+        actor_model_config.__dict__["action_chunk"] = int(yaml_horizon)
 
     # load model
     checkpoint_dir = download.maybe_download(str(cfg.model_path))

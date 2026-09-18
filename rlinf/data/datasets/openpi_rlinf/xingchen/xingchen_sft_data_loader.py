@@ -338,6 +338,7 @@ def build_xingchen_sft_dataloader(
         model_path,
         config_name,
         data_kwargs=data_kwargs,
+        action_horizon=action_horizon,
     )
 
     ario_dataset = ArioStreamingDataset(config=ario_cfg, action_horizon=action_horizon)

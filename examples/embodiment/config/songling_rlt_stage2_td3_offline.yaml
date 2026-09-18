@@ -20,7 +20,7 @@ cluster:
 
 runner:
   logger:
-    log_path: ../results
+    log_path: results
     project_name: rlinf-rlt
     experiment_name: songling_rlt_stage2_td3_offline
     logger_backends: [tensorboard]
@@ -126,8 +126,8 @@ actor:
     z_dim: 2048
     proprio_dim: 14
     action_dim: 14
-    num_action_chunks: 10
-    ref_num_action_chunks: 10
+    num_action_chunks: 50
+    ref_num_action_chunks: 50
     add_value_head: false
     add_q_head: true
     q_head_type: default

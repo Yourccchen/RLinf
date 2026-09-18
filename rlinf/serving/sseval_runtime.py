@@ -10,9 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-import numpy as np
 import torch
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 
 from rlinf.algorithms.rlt.rollout import (
     predict_rlt_candidates,
@@ -24,11 +23,143 @@ from rlinf.models import get_model
 from rlinf.serving.sseval_contract import (
     DualActionCandidates,
     TransitionFeedback,
+    songling_chunk_shape,
 )
 from rlinf.serving.sseval_learner import (
     InProcessLearnerConfig,
     InProcessRLTTD3Learner,
 )
+from rlinf.utils.logging import get_logger
+
+logger = get_logger()
+
+_FEATURE_KEYS_FROM_SFT = (
+    "model_type",
+    "num_action_chunks",
+    "action_dim",
+    "num_steps",
+    "add_value_head",
+    "is_lora",
+)
+
+
+def _repo_root_from_runtime(runtime_path: Path) -> Path:
+    for parent in (runtime_path.parent, *runtime_path.parents):
+        if (parent / "rlinf" / "serving").is_dir() and (parent / "examples").is_dir():
+            return parent
+    return runtime_path.parents[3]
+
+
+def resolve_stage1_sft_path(sft_ref: str, runtime_path: Path) -> Path:
+    """Resolve ``stage1_sft_config`` against the runtime YAML and repo root."""
+    candidate = Path(sft_ref).expanduser()
+    search = []
+    if candidate.is_absolute():
+        search.append(candidate)
+    else:
+        search.extend(
+            (
+                runtime_path.parent / candidate,
+                _repo_root_from_runtime(runtime_path) / candidate,
+                Path.cwd() / candidate,
+            )
+        )
+    for path in search:
+        resolved = path.resolve()
+        if resolved.is_file():
+            return resolved
+    raise FileNotFoundError(
+        f"stage1_sft_config {sft_ref!r} was not found relative to "
+        f"{runtime_path} or the RLinf repo root."
+    )
+
+
+def resolve_sseval_checkpoint_dir(
+    path_ref: str | Path, runtime_config_path: str | Path | None = None
+) -> Path:
+    """Resolve ``actor_checkpoint`` to a ``step_N`` directory with ``learner.pt``."""
+    path = Path(path_ref).expanduser()
+    if not path.is_absolute() and runtime_config_path is not None:
+        path = _repo_root_from_runtime(Path(runtime_config_path)) / path
+    path = path.resolve()
+    if not path.is_dir():
+        raise ValueError(
+            "actor_checkpoint must be a step_N directory containing learner.pt, "
+            f"got {path}."
+        )
+    if not (path / "learner.pt").is_file():
+        raise ValueError(f"actor_checkpoint {path} is missing learner.pt.")
+    return path
+
+
+def _copy_openpi_from_sft(src_model: DictConfig) -> dict[str, Any]:
+    raw = OmegaConf.to_container(src_model.openpi, resolve=False)
+    if not isinstance(raw, dict):
+        raise ValueError("actor.model.openpi must be a mapping in the Stage1 SFT YAML.")
+    chunks = int(src_model.num_action_chunks)
+    action_dim = int(src_model.action_dim)
+    num_steps = int(src_model.num_steps)
+    raw["task"] = "eval"
+    raw["action_chunk"] = chunks
+    raw["action_horizon"] = chunks
+    raw["action_env_dim"] = action_dim
+    raw["num_steps"] = num_steps
+    return raw
+
+
+def align_feature_model_from_sft_config(
+    cfg: DictConfig, runtime_config_path: str | Path
+) -> None:
+    """Copy frozen Stage1 fields from an SFT YAML into ``feature_model``.
+
+    ``stage1_sft_config`` points at a Stage1 Hydra experiment. ``actor.model``
+    supplies VLA/RLT shape, OpenPI transforms, and default ``openpi_data``.
+    Eval-side ``feature_model.openpi_data`` keys override the SFT copy so
+    ``norm_stats_path`` can differ from the training host. The same Stage1
+    ``num_action_chunks`` is copied onto ``actor_model`` execute and reference
+    horizons. The deploy YAML keeps ``feature_model.model_path``,
+    ``feature_model.precision``, and ``openpi.task=eval``.
+    """
+    sft_ref = OmegaConf.select(cfg, "stage1_sft_config", default=None)
+    if not sft_ref:
+        return
+    sft_path = resolve_stage1_sft_path(str(sft_ref), Path(runtime_config_path))
+    sft = OmegaConf.load(str(sft_path))
+    src = OmegaConf.select(sft, "actor.model")
+    if src is None:
+        raise ValueError(
+            f"{sft_path} has no actor.model; it is not a Stage1 SFT config."
+        )
+    if OmegaConf.select(src, "openpi", default=None) is None:
+        raise ValueError(f"{sft_path} actor.model.openpi is required for Stage1 align.")
+
+    with open_dict(cfg):
+        if OmegaConf.select(cfg, "feature_model", default=None) is None:
+            cfg.feature_model = {}
+        feature = cfg.feature_model
+        with open_dict(feature):
+            for key in _FEATURE_KEYS_FROM_SFT:
+                value = OmegaConf.select(src, key, default=None)
+                if value is not None:
+                    feature[key] = copy.deepcopy(value)
+            feature.openpi = _copy_openpi_from_sft(src)
+            sft_data = OmegaConf.select(src, "openpi_data", default=None)
+            eval_data = OmegaConf.select(feature, "openpi_data", default=None)
+            if sft_data is not None or eval_data is not None:
+                merged: dict[str, Any] = {}
+                if sft_data is not None:
+                    merged.update(OmegaConf.to_container(sft_data, resolve=False) or {})
+                if eval_data is not None:
+                    merged.update(
+                        OmegaConf.to_container(eval_data, resolve=False) or {}
+                    )
+                feature.openpi_data = merged
+        actor = OmegaConf.select(cfg, "actor_model", default=None)
+        if actor is not None:
+            chunks = int(src.num_action_chunks)
+            with open_dict(actor):
+                actor.num_action_chunks = chunks
+                actor.ref_num_action_chunks = chunks
 
 
 @dataclass
@@ -129,12 +260,32 @@ class SsEvalRLTRuntime:
         action_codec: SonglingActionCodec,
         learner: InProcessRLTTD3Learner,
         reference_seed: int = 2026,
+        chunk_len: int | None = None,
+        save_interval: int = 0,
+        save_dir: str | Path | None = None,
     ) -> None:
         self.feature_model = feature_model.eval().requires_grad_(False)
         self.active_policy_model = active_policy_model.eval().requires_grad_(False)
         self.action_codec = action_codec
         self.learner = learner
         self.reference_seed = int(reference_seed)
+        self.save_interval = int(save_interval)
+        if self.save_interval < 0:
+            raise ValueError(f"save_interval must be >= 0, got {self.save_interval}.")
+        if self.save_interval > 0 and not save_dir:
+            raise ValueError("save_dir is required when save_interval > 0.")
+        self.save_dir = Path(save_dir).expanduser() if save_dir else None
+        self._completed_chunks = 0
+        self._last_saved_step = 0
+        model_chunk_len = int(
+            getattr(active_policy_model, "chunk_len", 0)
+            or getattr(active_policy_model, "num_action_chunks", 0)
+            or 0
+        )
+        resolved = int(chunk_len) if chunk_len is not None else model_chunk_len
+        if resolved < 1:
+            raise ValueError(f"SsEval RLT chunk_len must be positive, got {resolved}.")
+        self.chunk_len = resolved
         self._seed_index = 0
         self._episode_id: str | None = None
         self._instruction = ""
@@ -149,30 +300,43 @@ class SsEvalRLTRuntime:
     @classmethod
     def from_config(cls, config_path: str | Path) -> "SsEvalRLTRuntime":
         cfg = OmegaConf.load(str(config_path))
+        align_feature_model_from_sft_config(cfg, config_path)
         OmegaConf.resolve(cfg)
         validate_rlt_stage2_configs(cfg.actor_model, cfg.feature_model)
         device = torch.device(str(cfg.get("device", "cuda")))
         feature_model = get_model(copy.deepcopy(cfg.feature_model)).to(device).eval()
         active_model = get_model(copy.deepcopy(cfg.actor_model)).to(device).eval()
-        actor_checkpoint = cfg.get("actor_checkpoint", None)
-        if actor_checkpoint:
-            state = torch.load(str(actor_checkpoint), map_location=device)
-            if isinstance(state, dict) and "state_dict" in state:
-                state = state["state_dict"]
-            active_model.load_state_dict(state, strict=True)
         codec = SonglingActionCodec.from_config(cfg.action_codec)
         learner_model = copy.deepcopy(active_model).train().requires_grad_(True)
         learner_cfg = InProcessLearnerConfig.from_mapping(
             OmegaConf.to_container(cfg.get("learner", {}), resolve=True)
         )
         learner = InProcessRLTTD3Learner(learner_model, learner_cfg)
-        return cls(
+        save_interval = int(cfg.get("save_interval", 0) or 0)
+        save_dir = cfg.get("save_dir", None)
+        if save_interval > 0:
+            if not save_dir:
+                raise ValueError("save_dir is required when save_interval > 0.")
+            save_path = Path(str(save_dir)).expanduser()
+            if not save_path.is_absolute():
+                save_path = _repo_root_from_runtime(Path(config_path)) / save_path
+            save_dir = save_path.resolve()
+        runtime = cls(
             feature_model=feature_model,
             active_policy_model=active_model,
             action_codec=codec,
             learner=learner,
             reference_seed=int(cfg.get("reference_seed", 2026)),
+            chunk_len=int(cfg.actor_model.num_action_chunks),
+            save_interval=save_interval,
+            save_dir=save_dir,
         )
+        actor_checkpoint = cfg.get("actor_checkpoint", None)
+        if actor_checkpoint:
+            runtime.load_checkpoint(
+                resolve_sseval_checkpoint_dir(str(actor_checkpoint), config_path)
+            )
+        return runtime
 
     @property
     def active_actor_version(self) -> int:
@@ -238,8 +402,20 @@ class SsEvalRLTRuntime:
                 actor_version=self._active_actor_version,
                 reference_seed=seed,
             )
+            expected = songling_chunk_shape(self.chunk_len)
+            if (
+                candidates.vla_action.shape != expected
+                or candidates.actor_action.shape != expected
+            ):
+                raise ValueError(
+                    "RLT action candidates must both be "
+                    f"{expected}, got vla={candidates.vla_action.shape}, "
+                    f"actor={candidates.actor_action.shape}."
+                )
             feedback = (
-                TransitionFeedback.from_mapping(transition_feedback)
+                TransitionFeedback.from_mapping(
+                    transition_feedback, chunk_len=self.chunk_len
+                )
                 if transition_feedback is not None
                 else None
             )
@@ -258,6 +434,8 @@ class SsEvalRLTRuntime:
                 )
             self._next_chunk_id += 1
             self._seed_index += 1
+            self._completed_chunks += 1
+            self._maybe_save()
             return candidates
 
     def _ingest_feedback(
@@ -285,7 +463,9 @@ class SsEvalRLTRuntime:
             self._require_open()
             if self._episode_id is None or self._pending is None:
                 raise RuntimeError("No active SsEval RLT episode to end.")
-            feedback = TransitionFeedback.from_mapping(final_feedback)
+            feedback = TransitionFeedback.from_mapping(
+                final_feedback, chunk_len=self.chunk_len
+            )
             if not feedback.done:
                 raise ValueError("end_episode requires terminal or truncated feedback.")
             ingested = self._ingest_feedback(feedback, self._pending.replay_obs)
@@ -326,6 +506,26 @@ class SsEvalRLTRuntime:
         self._active_actor_version = int(version)
         return True
 
+    def _checkpoint_path(self, step: int) -> Path:
+        if self.save_dir is None:
+            raise RuntimeError("save_dir is not configured.")
+        return self.save_dir / f"step_{step}"
+
+    def _maybe_save(self, *, force: bool = False) -> None:
+        if self.save_interval <= 0 or self.save_dir is None:
+            return
+        step = int(self._completed_chunks)
+        if step <= 0:
+            return
+        if not force and step % self.save_interval != 0:
+            return
+        if step == self._last_saved_step:
+            return
+        path = self._checkpoint_path(step)
+        logger.info("Saving SsEval checkpoint at inference step %s to %s", step, path)
+        self.learner.save_checkpoint(path)
+        self._last_saved_step = step
+
     def save_checkpoint(self, path: str | Path) -> None:
         with self._lock:
             self._require_open()
@@ -336,7 +536,12 @@ class SsEvalRLTRuntime:
             self._require_open()
             if self._episode_id is not None:
                 raise RuntimeError("Checkpoint restore requires an episode boundary.")
-            self.learner.load_checkpoint(path)
+            checkpoint_dir = resolve_sseval_checkpoint_dir(path)
+            self.learner.load_checkpoint(checkpoint_dir)
+            self.active_policy_model.load_state_dict(
+                self.learner.model.state_dict(), strict=True
+            )
+            self.active_policy_model.eval().requires_grad_(False)
             self._activate_candidate_actor()
 
     def _require_open(self) -> None:
@@ -347,5 +552,6 @@ class SsEvalRLTRuntime:
         with self._lock:
             if self._closed:
                 return
+            self._maybe_save(force=True)
             self._closed = True
             self.learner.close()

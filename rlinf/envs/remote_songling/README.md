@@ -53,7 +53,7 @@ T+1 observations and step-aligned physical `executed_actions`, `rewards`,
 because TD3 cannot infer success/failure targets from actions alone.
 
 The following command runs frozen Stage1 inference, normalizes reference and
-executed actions, builds C=10 transitions at stride 2, and writes a replay
+executed actions, builds C=50 transitions at stride 2, and writes a replay
 checkpoint consumable by RLinf:
 
 ```bash
@@ -87,8 +87,8 @@ active Actor and its policy version change only on initial startup or after the
 single Songling environment reports an episode boundary; critics are never
 synchronized to rollout.
 
-Online collection records exactly one transition per fully executed C=10 RPC
-chunk (`transition_stride=10`), because intermediate observations do not pass
+Online collection records exactly one transition per fully executed C=50 RPC
+chunk (`transition_stride=50`), because intermediate observations do not pass
 through the Stage1 feature worker. Stride-2 overlapping windows are implemented
 in offline preprocessing. A non-C online stride fails at startup rather than
 silently storing actions that were not actually executed.

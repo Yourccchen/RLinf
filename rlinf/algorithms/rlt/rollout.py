@@ -20,7 +20,7 @@ import torch
 
 from rlinf.algorithms.rlt.route import RLTRoute, RLTRouteContext
 from rlinf.algorithms.rlt.transition import RLT_OBS_KEYS, RLT_TRANSITION_PREFIX
-from rlinf.serving.sseval_contract import DualActionCandidates
+from rlinf.serving.sseval_contract import ACTION_DIM, DualActionCandidates
 
 
 def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
@@ -89,27 +89,38 @@ def validate_rlt_stage2_configs(policy_cfg: Any, feature_cfg: Any) -> None:
         )
     config_name = str(_cfg_get(feature_openpi, "config_name", "")).lower()
     if "songling" in config_name:
+        horizon = int(_cfg_get(policy_cfg, "num_action_chunks"))
+        if horizon < 1:
+            raise ValueError(
+                f"Invalid Songling RLT configuration: Stage2 chunk length "
+                f"must be positive, got {horizon}."
+            )
         songling_checks = (
-            ("Stage2 action_dim", int(_cfg_get(policy_cfg, "action_dim")), 14),
+            ("Stage2 action_dim", int(_cfg_get(policy_cfg, "action_dim")), ACTION_DIM),
             (
                 "Stage2 proprio_dim",
                 int(_cfg_get(policy_cfg, "proprio_dim")),
-                14,
-            ),
-            (
-                "Stage2 chunk length",
-                int(_cfg_get(policy_cfg, "num_action_chunks")),
-                10,
+                ACTION_DIM,
             ),
             (
                 "Stage2 reference horizon",
                 int(_cfg_get(policy_cfg, "ref_num_action_chunks")),
-                10,
+                horizon,
             ),
             (
                 "Stage1 reference horizon",
                 int(_cfg_get(feature_cfg, "num_action_chunks")),
-                10,
+                horizon,
+            ),
+            (
+                "Stage1 openpi action_horizon",
+                int(_cfg_get(feature_openpi, "action_horizon", horizon)),
+                horizon,
+            ),
+            (
+                "Stage1 openpi action_chunk",
+                int(_cfg_get(feature_openpi, "action_chunk", horizon)),
+                horizon,
             ),
             (
                 "Stage1 model_action_dim",

@@ -20,6 +20,9 @@ from typing import Any
 import gymnasium as gym
 import numpy as np
 import torch
+
+from rlinf.serving.sseval_contract import CHUNK_LEN
+
 from .client import SonglingRPCClient, SonglingRPCError
 from .codec import SonglingActionCodec, decode_config_sequence
 
@@ -69,7 +72,7 @@ class RemoteSonglingEnv(gym.Env):
         )
         self.codec = SonglingActionCodec.from_config(cfg.action_codec)
         self.action_frequency_hz = float(cfg.get("action_frequency_hz", 50.0))
-        self.max_chunk_len = int(cfg.get("max_chunk_len", 10))
+        self.max_chunk_len = int(cfg.get("max_chunk_len", CHUNK_LEN))
         self.action_units = decode_config_sequence(
             cfg.get("action_units", []), "action_units"
         )
@@ -299,8 +302,7 @@ class RemoteSonglingEnv(gym.Env):
             or normalized.shape[2] != 14
         ):
             raise ValueError(
-                "RemoteSonglingEnv expects actions [1, K, 14], got "
-                f"{normalized.shape}."
+                f"RemoteSonglingEnv expects actions [1, K, 14], got {normalized.shape}."
             )
         chunk_len = int(normalized.shape[1])
         if not 1 <= chunk_len <= self.max_chunk_len:

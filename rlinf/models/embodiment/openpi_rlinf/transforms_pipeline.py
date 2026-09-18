@@ -23,6 +23,7 @@ def build_openpi_transforms(
     config_name: str,
     data_kwargs: dict[str, Any] | None = None,
     *,
+    action_horizon: int | None = None,
     norm_stats_dir: str | None = None,
     norm_stats_asset_id: str | None = None,
 ) -> tuple[Sequence, Sequence]:
@@ -47,7 +48,10 @@ def build_openpi_transforms(
     from rlinf.models.embodiment.openpi.dataconfig import get_openpi_config
 
     train_config = get_openpi_config(
-        config_name, model_path=str(model_path), data_kwargs=data_kwargs
+        config_name,
+        model_path=str(model_path),
+        data_kwargs=data_kwargs,
+        action_horizon=action_horizon,
     )
     upstream_model_config = train_config.model
 

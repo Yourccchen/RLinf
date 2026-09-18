@@ -1,54 +1,39 @@
 # In-process Runtime config loaded by RWI policy/policies/rlinf/policy.py.
 # This file is resolved only on the GPU Policy host.
+#
+# Frozen Stage1 VLA/RLT shape and OpenPI transforms are copied from
+# actor.model in stage1_sft_config. This file keeps the checkpoint path,
+# eval precision, norm stats path, TD3 actor, and learner. openpi.task is
+# forced to eval. Eval hosts do not share the Stage1 SFT assets path, so
+# feature_model.openpi_data.norm_stats_path is set here rather than copied
+# from training.
+# Execute/reference C is copied from Stage1 actor.model.num_action_chunks
+# onto feature_model and actor_model at load time. The numbers below are
+# only a fallback if stage1_sft_config is unset.
+
+stage1_sft_config: examples/sft/config/songling_bfjm_rlt_stage1_sft_openpi_pi05.yaml
 
 device: ${oc.env:SONGLING_RLT_DEVICE,cuda}
 reference_seed: 2026
-actor_checkpoint: ${oc.env:SONGLING_RLT_ACTOR_CHECKPOINT,''}
+# Null keeps a random Stage2 policy. Otherwise a step_N directory that
+# contains learner.pt and replay/, e.g. results/songling_rlt_sseval_td3/checkpoints/step_1
+actor_checkpoint: null
+# Every N completed inference chunks. 0 disables auto-save. 1 dumps after
+# each chunk so a live PolicyServer run can verify the path quickly.
+save_interval: 1
+# Relative paths resolve against the RLinf repo root, not the RWI cwd.
+save_dir: results/songling_rlt_sseval_td3/checkpoints
 
 action_codec:
   action_low: ${oc.env:SONGLING_ACTION_LOW}
   action_high: ${oc.env:SONGLING_ACTION_HIGH}
 
 feature_model:
-  model_type: openpi_rlinf
-  model_path: ${oc.env:SONGLING_RLT_STAGE1_CHECKPOINT}
+  model_path: /home/fanyiming/RLinf/checkpoints/songling_bfjm_rlt_stage1_sft_openpi_pi05/global_step_10000/actor
   precision: bf16
-  num_action_chunks: 10
-  action_dim: 14
-  num_steps: 5
-  add_value_head: false
   is_lora: false
   openpi_data:
-    repo_id: songling/bfjm_0915
-    default_prompt: build with blocks
-    norm_stats_path: /home/caimengchen/ckpts/songling_bfjm_0915_rlt_stage1_sft_openpi_pi05/norm_stats.json
-  openpi:
-    task: eval
-    config_name: pi05_rlt_songling_joint
-    num_images_in_input: 3
-    action_chunk: 10
-    action_horizon: 10
-    action_env_dim: 14
-    num_steps: 10
-    model_action_dim: 32
-    paligemma_variant: gemma_2b
-    action_expert_variant: gemma_300m
-    max_token_len: 200
-    discrete_state_input: true
-    train_expert_only: false
-    add_value_head: false
-    detach_critic_input: true
-    use_rlt: true
-    rlt_alpha: 1.0
-    rlt_input_dim: 2048
-    rlt_embed_dim: 2048
-    rlt_prefix_seq_len: 1024
-    rlt_num_layers: 2
-    rlt_num_heads: 8
-    rlt_mlp_ratio: 4.0
-    rlt_encoder_type: append_self_attention
-    rlt_image_only: false
-    rlt_use_mask: true
+    norm_stats_path: /home/fanyiming/RLinf/checkpoints/songling_bfjm_rlt_stage1_sft_openpi_pi05/global_step_10000/norm_stats.json
 
 actor_model:
   model_type: rlt_td3_mlp_policy
@@ -57,8 +42,8 @@ actor_model:
   z_dim: 2048
   proprio_dim: 14
   action_dim: 14
-  num_action_chunks: 10
-  ref_num_action_chunks: 10
+  num_action_chunks: 50
+  ref_num_action_chunks: 50
   add_value_head: false
   add_q_head: true
   q_head_type: default
@@ -69,8 +54,8 @@ actor_model:
   is_lora: false
 
 learner:
-  batch_size: 64
-  min_buffer_size: 100
+  batch_size: 8
+  min_buffer_size: 8
   replay_capacity: 50000
   utd: 5
   gamma: 0.99
@@ -83,7 +68,7 @@ learner:
   reference_dropout_prob: 0.5
   target_action_noise: true
   actor_update_action_noise: true
-  warmup_updates: 500
+  warmup_updates: 100
   warmup_bc_weight: 7.0
   warmup_q_weight: 0.05
   online_bc_weight: 2.8

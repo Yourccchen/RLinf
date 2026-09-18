@@ -18,6 +18,7 @@ from rlinf.models.embodiment.mlp_policy.rlt_td3_mlp_policy import RLTTD3MLPPolic
 from rlinf.models.embodiment.openpi_rlinf.eval_action_model import (
     OpenPiPytorchEvalActionModel,
 )
+from rlinf.serving.sseval_contract import CHUNK_LEN
 from rlinf.workers.actor.fsdp_rlt_td3_policy_worker import RLTTD3LossMixin
 from rlinf.workers.actor.fsdp_sac_policy_worker import should_update_actor
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
@@ -254,12 +255,12 @@ def test_stage1_stage2_config_validation_accepts_songling_contract():
             "z_dim": 2048,
             "proprio_dim": 14,
             "action_dim": 14,
-            "num_action_chunks": 10,
-            "ref_num_action_chunks": 10,
+            "num_action_chunks": CHUNK_LEN,
+            "ref_num_action_chunks": CHUNK_LEN,
         },
         {
             "action_dim": 14,
-            "num_action_chunks": 10,
+            "num_action_chunks": CHUNK_LEN,
             "openpi_data": {"repo_id": "songling/all_tasks"},
             "openpi": {
                 "task": "eval",
@@ -285,12 +286,12 @@ def test_stage1_stage2_config_validation_accepts_explicit_custom_norm_stats():
             "z_dim": 2048,
             "proprio_dim": 14,
             "action_dim": 14,
-            "num_action_chunks": 10,
-            "ref_num_action_chunks": 10,
+            "num_action_chunks": CHUNK_LEN,
+            "ref_num_action_chunks": CHUNK_LEN,
         },
         {
             "action_dim": 14,
-            "num_action_chunks": 10,
+            "num_action_chunks": CHUNK_LEN,
             "openpi_data": {
                 "repo_id": "songling/bfjm_0915",
                 "norm_stats_path": "/models/songling/bfjm_0915/norm_stats.json",
@@ -318,12 +319,12 @@ def test_stage1_stage2_config_validation_rejects_custom_repo_without_norm_stats(
         "z_dim": 2048,
         "proprio_dim": 14,
         "action_dim": 14,
-        "num_action_chunks": 10,
-        "ref_num_action_chunks": 10,
+        "num_action_chunks": CHUNK_LEN,
+        "ref_num_action_chunks": CHUNK_LEN,
     }
     feature = {
         "action_dim": 14,
-        "num_action_chunks": 10,
+        "num_action_chunks": CHUNK_LEN,
         "openpi_data": {
             "repo_id": "songling/bfjm_0915",
             "norm_stats_path": None,
@@ -353,12 +354,12 @@ def test_stage1_stage2_config_validation_rejects_songling_prefix_semantics():
         "z_dim": 2048,
         "proprio_dim": 14,
         "action_dim": 14,
-        "num_action_chunks": 10,
-        "ref_num_action_chunks": 10,
+        "num_action_chunks": CHUNK_LEN,
+        "ref_num_action_chunks": CHUNK_LEN,
     }
     feature = {
         "action_dim": 14,
-        "num_action_chunks": 10,
+        "num_action_chunks": CHUNK_LEN,
         "openpi_data": {"repo_id": "songling/all_tasks"},
         "openpi": {
             "task": "eval",
@@ -378,6 +379,51 @@ def test_stage1_stage2_config_validation_rejects_songling_prefix_semantics():
 
     with pytest.raises(ValueError, match="rlt_image_only"):
         validate_rlt_stage2_configs(policy, feature)
+
+
+def test_songling_train_config_action_horizon_matches_execute_chunk():
+    from rlinf.models.embodiment.openpi.dataconfig import get_openpi_config
+
+    joint = get_openpi_config("pi05_rlt_songling_joint")
+    all_tasks = get_openpi_config("pi05_rlt_songling_all")
+    assert joint.model.action_horizon == CHUNK_LEN
+    assert all_tasks.model.action_horizon == CHUNK_LEN
+    overridden = get_openpi_config("pi05_rlt_songling_joint", action_horizon=10)
+    assert overridden.model.action_horizon == 10
+    assert (
+        get_openpi_config("pi05_rlt_songling_joint").model.action_horizon == CHUNK_LEN
+    )
+
+
+def test_stage1_stage2_config_validation_accepts_matching_custom_chunk_len():
+    validate_rlt_stage2_configs(
+        {
+            "z_dim": 2048,
+            "proprio_dim": 14,
+            "action_dim": 14,
+            "num_action_chunks": 10,
+            "ref_num_action_chunks": 10,
+        },
+        {
+            "action_dim": 14,
+            "num_action_chunks": 10,
+            "openpi_data": {"repo_id": "songling/all_tasks"},
+            "openpi": {
+                "task": "eval",
+                "config_name": "pi05_rlt_songling_all",
+                "use_rlt": True,
+                "rlt_embed_dim": 2048,
+                "model_action_dim": 32,
+                "num_images_in_input": 3,
+                "rlt_image_only": False,
+                "rlt_use_mask": True,
+                "rlt_prefix_seq_len": 1024,
+                "rlt_num_layers": 2,
+                "rlt_num_heads": 8,
+                "rlt_encoder_type": "append_self_attention",
+            },
+        },
+    )
 
 
 def test_stage1_stage2_config_validation_reports_horizon_mismatch():
@@ -545,5 +591,10 @@ def test_rlt_rollout_payload_marks_reset_and_completed_episode_boundaries():
 
 def test_td3_actor_updates_after_every_second_critic_step():
     assert [should_update_actor(step, 2) for step in range(6)] == [
-        False, True, False, True, False, True
+        False,
+        True,
+        False,
+        True,
+        False,
+        True,
     ]

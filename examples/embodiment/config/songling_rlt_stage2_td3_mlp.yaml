@@ -21,7 +21,7 @@ cluster:
 runner:
   task_type: embodied
   logger:
-    log_path: ../results
+    log_path: results
     project_name: rlinf-rlt
     experiment_name: songling_rlt_stage2_td3_mlp
     logger_backends: [tensorboard]
@@ -110,11 +110,11 @@ env:
     max_episode_steps: 500
     max_steps_per_rollout_epoch: 500
     action_dim: 14
-    num_action_chunks: 10
-    ref_num_action_chunks: 10
+    num_action_chunks: 50
+    ref_num_action_chunks: 50
     action_frequency_hz: ${oc.env:SONGLING_ACTION_FREQUENCY_HZ}
     action_units: ${oc.env:SONGLING_ACTION_UNITS}
-    max_chunk_len: 10
+    max_chunk_len: 50
     critical_phase_default: true
     task_description: ${oc.env:SONGLING_TASK_PROMPT,fold clothes}
     image_shape: ${oc.env:SONGLING_IMAGE_SHAPE}
@@ -168,7 +168,7 @@ rollout:
   collect_prev_infos: false
   rlt_reference_seed: 2026
   # Online receives only the post-chunk RLT state; offline preprocessing defaults to stride 2.
-  transition_stride: 10
+  transition_stride: 50
   defer_actor_activation: true
   activate_actor_at_episode_boundary: true
 
@@ -200,7 +200,7 @@ rollout:
     model_type: openpi_rlinf
     model_path: ${oc.env:SONGLING_RLT_STAGE1_CHECKPOINT}
     precision: bf16
-    num_action_chunks: 10
+    num_action_chunks: 50
     action_dim: 14
     num_steps: 5
     add_value_head: false
@@ -212,8 +212,8 @@ rollout:
       task: eval
       config_name: pi05_rlt_songling_all
       num_images_in_input: 3
-      action_chunk: 10
-      action_horizon: 10
+      action_chunk: 50
+      action_horizon: 50
       action_env_dim: 14
       num_steps: 5
       model_action_dim: 32
@@ -253,8 +253,8 @@ actor:
     z_dim: 2048
     proprio_dim: 14
     action_dim: 14
-    num_action_chunks: 10
-    ref_num_action_chunks: 10
+    num_action_chunks: 50
+    ref_num_action_chunks: 50
     add_value_head: false
     add_q_head: true
     q_head_type: default

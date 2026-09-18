@@ -12,7 +12,18 @@ import numpy as np
 
 RLT_SSEVAL_PROTOCOL_VERSION = "songling-rlt-sseval-v1"
 ACTION_DIM = 14
-CHUNK_LEN = 10
+# Default used by the checked-in Songling recipe and tests. The wire contract
+# does not pin this value: execute length comes from Stage1
+# ``num_action_chunks`` and is advertised as Policy ``chunk_len``.
+CHUNK_LEN = 50
+
+
+def songling_chunk_shape(chunk_len: int) -> tuple[int, int]:
+    """Return the Songling ``(C, action_dim)`` chunk shape for ``chunk_len``."""
+    horizon = int(chunk_len)
+    if horizon < 1:
+        raise ValueError(f"chunk_len must be positive, got {horizon}.")
+    return horizon, ACTION_DIM
 
 
 class SelectedMode(str, Enum):
@@ -51,11 +62,15 @@ class DualActionCandidates:
         object.__setattr__(self, "chunk_id", int(self.chunk_id))
         vla = _array(self.vla_action, name="vla_action", dtype=np.float32, ndim=2)
         actor = _array(self.actor_action, name="actor_action", dtype=np.float32, ndim=2)
-        expected = (CHUNK_LEN, ACTION_DIM)
-        if vla.shape != expected or actor.shape != expected:
+        if vla.shape[0] < 1 or vla.shape[1] != ACTION_DIM:
             raise ValueError(
-                f"Songling candidates must both have shape {expected}, got "
-                f"vla={vla.shape}, actor={actor.shape}."
+                f"vla_action must have shape (C, {ACTION_DIM}) with C>=1, "
+                f"got {vla.shape}."
+            )
+        if vla.shape != actor.shape:
+            raise ValueError(
+                "Songling candidates must both have the same shape "
+                f"(C, {ACTION_DIM}), got vla={vla.shape}, actor={actor.shape}."
             )
         object.__setattr__(self, "vla_action", vla)
         object.__setattr__(self, "actor_action", actor)
@@ -76,6 +91,7 @@ class DualActionCandidates:
             "actor_version": self.actor_version,
             "feature_checkpoint_hash": self.feature_checkpoint_hash,
             "reference_seed": self.reference_seed,
+            "chunk_len": int(self.vla_action.shape[0]),
         }
 
 
@@ -95,7 +111,9 @@ class TransitionFeedback:
     timestamps: Mapping[str, Any]
 
     @classmethod
-    def from_mapping(cls, payload: Mapping[str, Any]) -> "TransitionFeedback":
+    def from_mapping(
+        cls, payload: Mapping[str, Any], *, chunk_len: int | None = None
+    ) -> "TransitionFeedback":
         version = payload.get("rlt_protocol_version")
         if version != RLT_SSEVAL_PROTOCOL_VERSION:
             raise ValueError(
@@ -112,17 +130,20 @@ class TransitionFeedback:
             dtype=np.float32,
             ndim=2,
         )
-        if actions.shape != (CHUNK_LEN, ACTION_DIM):
+        expected = songling_chunk_shape(
+            int(actions.shape[0] if chunk_len is None else chunk_len)
+        )
+        if actions.shape != expected:
             raise ValueError(
                 "executed_actions must be padded to "
-                f"{(CHUNK_LEN, ACTION_DIM)}, got {actions.shape}."
+                f"{expected}, got {actions.shape}."
             )
 
         def vector(name: str, dtype: Any) -> np.ndarray:
             value = _array(payload.get(name), name=name, dtype=dtype, ndim=1)
-            if value.shape != (CHUNK_LEN,):
+            if value.shape != (expected[0],):
                 raise ValueError(
-                    f"{name} must have shape {(CHUNK_LEN,)}, got {value.shape}."
+                    f"{name} must have shape {(expected[0],)}, got {value.shape}."
                 )
             return value
 
