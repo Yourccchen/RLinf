@@ -17,6 +17,9 @@ import torch.nn.functional as F
 from rlinf.data.schema.embodied_types import Trajectory
 from rlinf.data.storage.replay import TrajectoryReplayBuffer
 from rlinf.models.embodiment.base_policy import ForwardType
+from rlinf.utils.logging import get_logger
+
+logger = get_logger()
 
 
 @dataclass(frozen=True)
@@ -82,12 +85,21 @@ class InProcessRLTTD3Learner:
         config: InProcessLearnerConfig | Mapping[str, Any] | None = None,
         *,
         start_background: bool = True,
+        save_interval: int = 0,
+        save_dir: str | Path | None = None,
     ) -> None:
         self.config = (
             config
             if isinstance(config, InProcessLearnerConfig)
             else InProcessLearnerConfig.from_mapping(config)
         )
+        self.save_interval = int(save_interval)
+        if self.save_interval < 0:
+            raise ValueError(f"save_interval must be >= 0, got {self.save_interval}.")
+        if self.save_interval > 0 and not save_dir:
+            raise ValueError("save_dir is required when save_interval > 0.")
+        self.save_dir = Path(save_dir).expanduser() if save_dir else None
+        self._last_saved_step = 0
         self.model = model
         self.device = next(model.parameters()).device
         self.target_model = copy.deepcopy(model).requires_grad_(False).eval()
@@ -168,6 +180,7 @@ class InProcessRLTTD3Learner:
                 return
             for _ in range(self.config.utd):
                 self.train_once()
+                self._maybe_save()
 
     def _objective_weights(self) -> tuple[float, float]:
         cfg = self.config
@@ -318,29 +331,52 @@ class InProcessRLTTD3Learner:
         self._queue.join()
         self.raise_if_failed()
 
-    def save_checkpoint(self, path: str | Path) -> None:
-        self.wait_idle()
+    def _checkpoint_path(self, step: int) -> Path:
+        if self.save_dir is None:
+            raise RuntimeError("save_dir is not configured.")
+        return self.save_dir / f"step_{step}"
+
+    def _maybe_save(self, *, force: bool = False) -> None:
+        if self.save_interval <= 0 or self.save_dir is None:
+            return
+        step = int(self.update_step)
+        if step <= 0:
+            return
+        if not force and step % self.save_interval != 0:
+            return
+        if step == self._last_saved_step:
+            return
+        path = self._checkpoint_path(step)
+        logger.info("Saving SsEval checkpoint at update_step %s to %s", step, path)
+        self._write_checkpoint(path)
+        self._last_saved_step = step
+
+    def _write_checkpoint(self, path: str | Path) -> None:
         root = Path(path)
         root.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "model": self.model.state_dict(),
+                "target_model": self.target_model.state_dict(),
+                "actor_optimizer": self.actor_optimizer.state_dict(),
+                "critic_optimizer": self.critic_optimizer.state_dict(),
+                "update_step": self.update_step,
+                "total_transitions": self.total_transitions,
+                "torch_rng_state": torch.random.get_rng_state(),
+                "cuda_rng_state_all": (
+                    torch.cuda.get_rng_state_all()
+                    if torch.cuda.is_available()
+                    else None
+                ),
+            },
+            root / "learner.pt",
+        )
+        self.replay.save_checkpoint(str(root / "replay"))
+
+    def save_checkpoint(self, path: str | Path) -> None:
+        self.wait_idle()
         with self._train_lock:
-            torch.save(
-                {
-                    "model": self.model.state_dict(),
-                    "target_model": self.target_model.state_dict(),
-                    "actor_optimizer": self.actor_optimizer.state_dict(),
-                    "critic_optimizer": self.critic_optimizer.state_dict(),
-                    "update_step": self.update_step,
-                    "total_transitions": self.total_transitions,
-                    "torch_rng_state": torch.random.get_rng_state(),
-                    "cuda_rng_state_all": (
-                        torch.cuda.get_rng_state_all()
-                        if torch.cuda.is_available()
-                        else None
-                    ),
-                },
-                root / "learner.pt",
-            )
-            self.replay.save_checkpoint(str(root / "replay"))
+            self._write_checkpoint(path)
 
     def load_checkpoint(self, path: str | Path) -> None:
         self.wait_idle()
@@ -361,6 +397,7 @@ class InProcessRLTTD3Learner:
                 torch.cuda.set_rng_state_all(cuda_state)
             self.replay.clear()
             self.replay.load_checkpoint(str(root / "replay"))
+            self._last_saved_step = self.update_step
             self._publish_candidate(self.update_step)
 
     def close(self) -> None:
@@ -372,4 +409,6 @@ class InProcessRLTTD3Learner:
             self._thread.join(timeout=30.0)
             if self._thread.is_alive():
                 raise RuntimeError("SsEval RLT learner did not stop within 30 seconds.")
+        with self._train_lock:
+            self._maybe_save(force=True)
         self.replay.close()

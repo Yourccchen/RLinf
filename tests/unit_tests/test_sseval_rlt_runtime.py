@@ -106,29 +106,81 @@ def _runtime():
     return runtime, learner
 
 
-def test_runtime_autosaves_every_save_interval_chunks(tmp_path):
+def test_runtime_inference_does_not_autosave():
     runtime, learner = _runtime()
-    runtime.save_interval = 2
-    runtime.save_dir = tmp_path
-    runtime.start_episode("episode-1", "fold clothes")
-    runtime.infer_candidates(_observation(0.0))
-    runtime.infer_candidates(_observation(1.0), _feedback(0))
-    runtime.infer_candidates(_observation(2.0), _feedback(1))
-    runtime.infer_candidates(_observation(3.0), _feedback(2))
-
-    assert learner.saved == [str(tmp_path / "step_2"), str(tmp_path / "step_4")]
-
-
-def test_runtime_close_force_saves_remainder(tmp_path):
-    runtime, learner = _runtime()
-    runtime.save_interval = 5
-    runtime.save_dir = tmp_path
     runtime.start_episode("episode-1", "fold clothes")
     runtime.infer_candidates(_observation(0.0))
     runtime.infer_candidates(_observation(1.0), _feedback(0))
     runtime.close()
 
-    assert learner.saved == [str(tmp_path / "step_2")]
+    assert learner.saved == []
+
+
+def _offline_rlt_trajectory(chunk_len: int = 10):
+    features = [
+        {
+            "z_rl": torch.zeros(8),
+            "proprio": torch.zeros(14),
+            "ref_chunk": torch.zeros(chunk_len, 14),
+        }
+        for _ in range(chunk_len + 1)
+    ]
+    episode = {
+        "executed_actions": torch.zeros(chunk_len, 14),
+        "rewards": torch.zeros(chunk_len),
+        "terminated": torch.tensor([False] * (chunk_len - 1) + [True]),
+        "truncated": torch.zeros(chunk_len, dtype=torch.bool),
+    }
+    return build_offline_rlt_trajectories(
+        episode, features, chunk_len=chunk_len, transition_stride=chunk_len
+    )[0]
+
+
+def _td3_learner(*, save_interval=0, save_dir=None, utd=2):
+    model = RLTTD3MLPPolicy(
+        z_dim=8,
+        proprio_dim=14,
+        action_dim=14,
+        num_action_chunks=10,
+        actor_noise_sigma=0.0,
+    )
+    return InProcessRLTTD3Learner(
+        model,
+        InProcessLearnerConfig(
+            batch_size=1,
+            min_buffer_size=1,
+            replay_capacity=8,
+            utd=utd,
+            actor_update_interval=2,
+            warmup_updates=2,
+        ),
+        start_background=False,
+        save_interval=save_interval,
+        save_dir=save_dir,
+    )
+
+
+def test_learner_autosaves_every_save_interval_update_steps(tmp_path):
+    learner = _td3_learner(save_interval=2, save_dir=tmp_path, utd=2)
+    trajectory = _offline_rlt_trajectory()
+    learner.add_and_train(trajectory)
+    learner.add_and_train(trajectory)
+
+    assert (tmp_path / "step_2" / "learner.pt").is_file()
+    assert (tmp_path / "step_4" / "learner.pt").is_file()
+    assert not (tmp_path / "step_1").exists()
+    assert not (tmp_path / "step_3").exists()
+    learner.close()
+
+
+def test_learner_close_force_saves_remainder(tmp_path):
+    learner = _td3_learner(save_interval=5, save_dir=tmp_path, utd=2)
+    learner.add_and_train(_offline_rlt_trajectory())
+    assert not (tmp_path / "step_2").exists()
+
+    learner.close()
+
+    assert (tmp_path / "step_2" / "learner.pt").is_file()
 
 
 def test_runtime_emits_candidates_and_ingests_executed_feedback():

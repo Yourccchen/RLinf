@@ -17,10 +17,11 @@ device: ${oc.env:SONGLING_RLT_DEVICE,cuda}
 reference_seed: 2026
 # Null keeps a random Stage2 policy. Otherwise a step_N directory that
 # contains learner.pt and replay/, e.g. results/songling_rlt_sseval_td3/checkpoints/step_1
+# N is the TD3 update_step stored in learner.pt.
 actor_checkpoint: null
-# Every N completed inference chunks. 0 disables auto-save. 1 dumps after
-# each chunk so a live PolicyServer run can verify the path quickly.
-save_interval: 1
+# Every N TD3 update_step (critic gradient steps). 0 disables auto-save.
+# 1 dumps after each update once replay has reached min_buffer_size.
+save_interval: 10
 # Relative paths resolve against the RLinf repo root, not the RWI cwd.
 save_dir: results/songling_rlt_sseval_td3/checkpoints
 

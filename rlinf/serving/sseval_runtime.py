@@ -29,9 +29,6 @@ from rlinf.serving.sseval_learner import (
     InProcessLearnerConfig,
     InProcessRLTTD3Learner,
 )
-from rlinf.utils.logging import get_logger
-
-logger = get_logger()
 
 _FEATURE_KEYS_FROM_SFT = (
     "model_type",
@@ -261,22 +258,12 @@ class SsEvalRLTRuntime:
         learner: InProcessRLTTD3Learner,
         reference_seed: int = 2026,
         chunk_len: int | None = None,
-        save_interval: int = 0,
-        save_dir: str | Path | None = None,
     ) -> None:
         self.feature_model = feature_model.eval().requires_grad_(False)
         self.active_policy_model = active_policy_model.eval().requires_grad_(False)
         self.action_codec = action_codec
         self.learner = learner
         self.reference_seed = int(reference_seed)
-        self.save_interval = int(save_interval)
-        if self.save_interval < 0:
-            raise ValueError(f"save_interval must be >= 0, got {self.save_interval}.")
-        if self.save_interval > 0 and not save_dir:
-            raise ValueError("save_dir is required when save_interval > 0.")
-        self.save_dir = Path(save_dir).expanduser() if save_dir else None
-        self._completed_chunks = 0
-        self._last_saved_step = 0
         model_chunk_len = int(
             getattr(active_policy_model, "chunk_len", 0)
             or getattr(active_policy_model, "num_action_chunks", 0)
@@ -311,7 +298,6 @@ class SsEvalRLTRuntime:
         learner_cfg = InProcessLearnerConfig.from_mapping(
             OmegaConf.to_container(cfg.get("learner", {}), resolve=True)
         )
-        learner = InProcessRLTTD3Learner(learner_model, learner_cfg)
         save_interval = int(cfg.get("save_interval", 0) or 0)
         save_dir = cfg.get("save_dir", None)
         if save_interval > 0:
@@ -321,6 +307,12 @@ class SsEvalRLTRuntime:
             if not save_path.is_absolute():
                 save_path = _repo_root_from_runtime(Path(config_path)) / save_path
             save_dir = save_path.resolve()
+        learner = InProcessRLTTD3Learner(
+            learner_model,
+            learner_cfg,
+            save_interval=save_interval,
+            save_dir=save_dir,
+        )
         runtime = cls(
             feature_model=feature_model,
             active_policy_model=active_model,
@@ -328,8 +320,6 @@ class SsEvalRLTRuntime:
             learner=learner,
             reference_seed=int(cfg.get("reference_seed", 2026)),
             chunk_len=int(cfg.actor_model.num_action_chunks),
-            save_interval=save_interval,
-            save_dir=save_dir,
         )
         actor_checkpoint = cfg.get("actor_checkpoint", None)
         if actor_checkpoint:
@@ -434,8 +424,6 @@ class SsEvalRLTRuntime:
                 )
             self._next_chunk_id += 1
             self._seed_index += 1
-            self._completed_chunks += 1
-            self._maybe_save()
             return candidates
 
     def _ingest_feedback(
@@ -506,26 +494,6 @@ class SsEvalRLTRuntime:
         self._active_actor_version = int(version)
         return True
 
-    def _checkpoint_path(self, step: int) -> Path:
-        if self.save_dir is None:
-            raise RuntimeError("save_dir is not configured.")
-        return self.save_dir / f"step_{step}"
-
-    def _maybe_save(self, *, force: bool = False) -> None:
-        if self.save_interval <= 0 or self.save_dir is None:
-            return
-        step = int(self._completed_chunks)
-        if step <= 0:
-            return
-        if not force and step % self.save_interval != 0:
-            return
-        if step == self._last_saved_step:
-            return
-        path = self._checkpoint_path(step)
-        logger.info("Saving SsEval checkpoint at inference step %s to %s", step, path)
-        self.learner.save_checkpoint(path)
-        self._last_saved_step = step
-
     def save_checkpoint(self, path: str | Path) -> None:
         with self._lock:
             self._require_open()
@@ -552,6 +520,5 @@ class SsEvalRLTRuntime:
         with self._lock:
             if self._closed:
                 return
-            self._maybe_save(force=True)
             self._closed = True
             self.learner.close()
