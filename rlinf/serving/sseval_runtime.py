@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import copy
+import re
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +18,7 @@ from rlinf.algorithms.rlt.rollout import (
     predict_rlt_candidates,
     validate_rlt_stage2_configs,
 )
+from rlinf.algorithms.rlt.transition import overwrite_rlt_ref_with_human
 from rlinf.data.schema.embodied_types import Trajectory
 from rlinf.envs.remote_songling import SonglingActionCodec
 from rlinf.models import get_model
@@ -71,14 +73,20 @@ def resolve_stage1_sft_path(sft_ref: str, runtime_path: Path) -> Path:
     )
 
 
+def _resolve_sseval_path(
+    path_ref: str | Path, runtime_config_path: str | Path | None = None
+) -> Path:
+    path = Path(path_ref).expanduser()
+    if not path.is_absolute() and runtime_config_path is not None:
+        path = _repo_root_from_runtime(Path(runtime_config_path)) / path
+    return path.resolve()
+
+
 def resolve_sseval_checkpoint_dir(
     path_ref: str | Path, runtime_config_path: str | Path | None = None
 ) -> Path:
     """Resolve ``actor_checkpoint`` to a ``step_N`` directory with ``learner.pt``."""
-    path = Path(path_ref).expanduser()
-    if not path.is_absolute() and runtime_config_path is not None:
-        path = _repo_root_from_runtime(Path(runtime_config_path)) / path
-    path = path.resolve()
+    path = _resolve_sseval_path(path_ref, runtime_config_path)
     if not path.is_dir():
         raise ValueError(
             "actor_checkpoint must be a step_N directory containing learner.pt, "
@@ -87,6 +95,55 @@ def resolve_sseval_checkpoint_dir(
     if not (path / "learner.pt").is_file():
         raise ValueError(f"actor_checkpoint {path} is missing learner.pt.")
     return path
+
+
+def resolve_sseval_replay_dir(
+    path_ref: str | Path, runtime_config_path: str | Path | None = None
+) -> Path:
+    """Resolve ``replay_checkpoint`` to a directory with replay ``metadata.json``.
+
+    Accepts a ``step_N`` directory that contains ``replay/``, or the ``replay/``
+    directory itself.
+    """
+    path = _resolve_sseval_path(path_ref, runtime_config_path)
+    if not path.is_dir():
+        raise ValueError(
+            "replay_checkpoint must be a step_N directory containing replay/, "
+            f"or a replay directory with metadata.json, got {path}."
+        )
+    nested = path / "replay" / "metadata.json"
+    if nested.is_file():
+        return (path / "replay").resolve()
+    if (path / "metadata.json").is_file():
+        return path
+    raise ValueError(
+        "replay_checkpoint must be a step_N directory containing replay/, "
+        f"or a replay directory with metadata.json, got {path}."
+    )
+
+
+def apply_sseval_restore(
+    runtime: "SsEvalRLTRuntime",
+    cfg: DictConfig,
+    config_path: str | Path,
+) -> None:
+    """Restore from ``actor_checkpoint`` or ``replay_checkpoint``, not both."""
+    actor_checkpoint = cfg.get("actor_checkpoint", None)
+    replay_checkpoint = cfg.get("replay_checkpoint", None)
+    if actor_checkpoint and replay_checkpoint:
+        raise ValueError(
+            "actor_checkpoint and replay_checkpoint cannot both be set. "
+            "Use actor_checkpoint to restore learner weights and replay, "
+            "or replay_checkpoint to reuse replay only."
+        )
+    if actor_checkpoint:
+        runtime.load_checkpoint(
+            resolve_sseval_checkpoint_dir(str(actor_checkpoint), config_path)
+        )
+    elif replay_checkpoint:
+        runtime.load_replay_checkpoint(
+            resolve_sseval_replay_dir(str(replay_checkpoint), config_path)
+        )
 
 
 def _copy_openpi_from_sft(src_model: DictConfig) -> dict[str, Any]:
@@ -159,6 +216,25 @@ def align_feature_model_from_sft_config(
                 actor.ref_num_action_chunks = chunks
 
 
+_REPLAY_ID_UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def sseval_replay_weights_id(
+    episode_id: str, chunk_id: int, selected_mode: str
+) -> str:
+    """Return the replay file suffix for one SsEval transition.
+
+    Replay files are ``trajectory_{id}_{model_weights_id}.pt``. The suffix
+    names the collected chunk and who executed it. Actor snapshot versions
+    stay in ``Trajectory.versions``; putting them here looks like a worker
+    rank or checkpoint step.
+    """
+    safe = _REPLAY_ID_UNSAFE.sub("-", str(episode_id)).strip("-._")
+    if not safe:
+        safe = "episode"
+    return f"ep-{safe[:80]}_chunk-{int(chunk_id)}_{selected_mode}"
+
+
 @dataclass
 class _PendingInference:
     episode_id: str
@@ -218,10 +294,19 @@ def _build_feedback_trajectory(
     valid = torch.from_numpy(feedback.valid_step_mask).bool()
     intervene = torch.from_numpy(feedback.intervene_flags).bool()
     curr = _unbatch_replay_obs(pending.replay_obs)
+    curr["ref_chunk"] = overwrite_rlt_ref_with_human(
+        curr["ref_chunk"].unsqueeze(0),
+        normalized_actions.reshape(1, -1),
+        intervene.unsqueeze(0),
+    ).squeeze(0)
     nxt = _unbatch_replay_obs(next_obs)
     return Trajectory(
         max_episode_length=1,
-        model_weights_id=f"sseval_actor_{pending.actor_version}",
+        model_weights_id=sseval_replay_weights_id(
+            pending.episode_id,
+            pending.chunk_id,
+            feedback.selected_mode.value,
+        ),
         actions=normalized_actions.reshape(1, 1, -1),
         intervene_flags=intervene.reshape(1, 1, -1),
         rewards=rewards.reshape(1, 1, -1),
@@ -247,7 +332,11 @@ def _build_feedback_trajectory(
 
 
 class SsEvalRLTRuntime:
-    """Serial inference facade with a non-blocking asynchronous TD3 learner."""
+    """Serial inference facade with a non-blocking asynchronous TD3 learner.
+
+    Executed chunks stay in an episode buffer until a labeled outcome arrives.
+    Success and failure flush the buffer into replay; abort/truncate drops it.
+    """
 
     def __init__(
         self,
@@ -278,6 +367,7 @@ class SsEvalRLTRuntime:
         self._instruction = ""
         self._next_chunk_id = 0
         self._pending: _PendingInference | None = None
+        self._episode_buffer: list[Trajectory] = []
         self._seen_feedback: set[tuple[str, int]] = set()
         self._active_actor_version = 0
         self._episode_actor_ready = False
@@ -321,11 +411,7 @@ class SsEvalRLTRuntime:
             reference_seed=int(cfg.get("reference_seed", 2026)),
             chunk_len=int(cfg.actor_model.num_action_chunks),
         )
-        actor_checkpoint = cfg.get("actor_checkpoint", None)
-        if actor_checkpoint:
-            runtime.load_checkpoint(
-                resolve_sseval_checkpoint_dir(str(actor_checkpoint), config_path)
-            )
+        apply_sseval_restore(runtime, cfg, config_path)
         return runtime
 
     @property
@@ -353,6 +439,7 @@ class SsEvalRLTRuntime:
             self._instruction = instruction
             self._next_chunk_id = 0
             self._pending = None
+            self._episode_buffer.clear()
             self._seen_feedback.clear()
             self._episode_actor_ready = bool(self.learner.actor_ready)
             return episode_id
@@ -412,9 +499,7 @@ class SsEvalRLTRuntime:
             if feedback is not None:
                 self._ingest_feedback(feedback, replay_obs)
             if feedback is not None and feedback.done:
-                self._episode_id = None
-                self._instruction = ""
-                self._pending = None
+                self._close_episode()
             else:
                 self._pending = _PendingInference(
                     episode_id=self._episode_id,
@@ -442,9 +527,25 @@ class SsEvalRLTRuntime:
         trajectory = _build_feedback_trajectory(
             pending, next_obs, feedback, self.action_codec
         )
-        self.learner.submit(trajectory)
+        self._episode_buffer.append(trajectory)
         self._seen_feedback.add(feedback.key)
+        if feedback.done:
+            self._resolve_episode_buffer(feedback)
         return True
+
+    def _resolve_episode_buffer(self, feedback: TransitionFeedback) -> None:
+        trajectories = self._episode_buffer
+        self._episode_buffer = []
+        if not feedback.has_labeled_outcome:
+            return
+        for trajectory in trajectories:
+            self.learner.submit(trajectory)
+
+    def _close_episode(self) -> None:
+        self._episode_id = None
+        self._instruction = ""
+        self._pending = None
+        self._episode_buffer.clear()
 
     def end_episode(self, final_feedback: Mapping[str, Any]) -> bool:
         with self._lock:
@@ -457,16 +558,12 @@ class SsEvalRLTRuntime:
             if not feedback.done:
                 raise ValueError("end_episode requires terminal or truncated feedback.")
             ingested = self._ingest_feedback(feedback, self._pending.replay_obs)
-            self._episode_id = None
-            self._instruction = ""
-            self._pending = None
+            self._close_episode()
             return ingested
 
     def reset(self) -> None:
         with self._lock:
-            self._episode_id = None
-            self._instruction = ""
-            self._pending = None
+            self._close_episode()
             self._next_chunk_id = 0
             self._seen_feedback.clear()
 
@@ -512,6 +609,15 @@ class SsEvalRLTRuntime:
             self.active_policy_model.eval().requires_grad_(False)
             self._activate_candidate_actor()
 
+    def load_replay_checkpoint(self, path: str | Path) -> None:
+        """Load replay only, catch up TD3 updates, and keep a fresh Stage2 actor."""
+        with self._lock:
+            self._require_open()
+            if self._episode_id is not None:
+                raise RuntimeError("Checkpoint restore requires an episode boundary.")
+            self.learner.load_replay(resolve_sseval_replay_dir(path))
+            self._activate_candidate_actor()
+
     def _require_open(self) -> None:
         if self._closed:
             raise RuntimeError("SsEval RLT runtime is closed.")
@@ -521,4 +627,6 @@ class SsEvalRLTRuntime:
             if self._closed:
                 return
             self._closed = True
+            self._close_episode()
+            self._seen_feedback.clear()
             self.learner.close()

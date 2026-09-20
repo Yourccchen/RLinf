@@ -11,6 +11,7 @@ from rlinf.algorithms.rlt.rollout import (
     validate_rlt_stage2_configs,
 )
 from rlinf.algorithms.rlt.route import RLTRouteContext, RealworldRLTRoute
+from rlinf.algorithms.rlt.transition import overwrite_rlt_ref_with_human
 from rlinf.data.schema.embodied_types import Trajectory
 from rlinf.data.storage.replay.buffer import TrajectoryReplayBuffer
 from rlinf.models.embodiment.base_policy import ForwardType
@@ -45,6 +46,28 @@ def _route_context(*, version: int) -> RLTRouteContext:
         mode="train",
         rlt_switch_flags=torch.ones(batch_size, 1, dtype=torch.bool),
         version=version,
+    )
+
+
+def test_overwrite_rlt_ref_with_human_replaces_intervened_steps_only():
+    ref = torch.zeros(2, 4, 3)
+    actions = torch.arange(2 * 4 * 3, dtype=torch.float32).reshape(2, 4, 3)
+    flags = torch.tensor(
+        [[True, True, False, False], [False, True, True, False]],
+        dtype=torch.bool,
+    )
+
+    out = overwrite_rlt_ref_with_human(ref, actions.reshape(2, -1), flags)
+
+    torch.testing.assert_close(out[0, :2], actions[0, :2])
+    torch.testing.assert_close(out[0, 2:], torch.zeros(2, 3))
+    torch.testing.assert_close(out[1, 1:3], actions[1, 1:3])
+    torch.testing.assert_close(out[1, 0], torch.zeros(3))
+    torch.testing.assert_close(out[1, 3], torch.zeros(3))
+    assert overwrite_rlt_ref_with_human(ref, actions, None) is ref
+    torch.testing.assert_close(
+        overwrite_rlt_ref_with_human(ref, actions, torch.zeros_like(flags)),
+        ref,
     )
 
 
@@ -123,6 +146,91 @@ def test_songling_td3_shapes_and_reference_horizon_slice():
     assert q_values.shape == (3, 2)
     assert torch.all(actions >= -1.0)
     assert torch.all(actions <= 1.0)
+
+
+def test_residual_actor_copies_reference_before_training():
+    torch.manual_seed(0)
+    policy = RLTTD3MLPPolicy(
+        z_dim=8,
+        proprio_dim=4,
+        action_dim=2,
+        num_action_chunks=3,
+        actor_residual=True,
+        actor_noise_sigma=0.0,
+        ref_action_dropout=0.5,
+    )
+    obs = {
+        "z_rl": torch.randn(4, 8),
+        "proprio": torch.randn(4, 4),
+        "ref_chunk": torch.rand(4, 3, 2) * 1.6 - 0.8,
+    }
+    expected = obs["ref_chunk"].reshape(4, -1).clamp(-1.0, 1.0)
+
+    actions, _, _ = policy(
+        forward_type=ForwardType.SAC,
+        obs=copy.deepcopy(obs),
+        deterministic=True,
+        apply_action_noise=False,
+    )
+    torch.testing.assert_close(actions, expected)
+
+    dropped, _, _ = policy(
+        forward_type=ForwardType.SAC,
+        obs=copy.deepcopy(obs),
+        deterministic=False,
+        apply_action_noise=False,
+        apply_reference_dropout=True,
+        reference_dropout_prob=1.0,
+    )
+    torch.testing.assert_close(dropped, expected)
+
+
+def test_residual_actor_adds_correction_to_reference():
+    policy = RLTTD3MLPPolicy(
+        z_dim=8,
+        proprio_dim=4,
+        action_dim=2,
+        num_action_chunks=3,
+        actor_residual=True,
+        actor_noise_sigma=0.0,
+    )
+    last = None
+    for child in policy.actor.mlp.modules():
+        if isinstance(child, torch.nn.Linear):
+            last = child
+    assert last is not None
+    last.bias.data.fill_(0.1)
+
+    obs = {
+        "z_rl": torch.zeros(2, 8),
+        "proprio": torch.zeros(2, 4),
+        "ref_chunk": torch.full((2, 3, 2), 0.2),
+    }
+    actions, _, _ = policy(
+        forward_type=ForwardType.SAC,
+        obs=obs,
+        deterministic=True,
+        apply_action_noise=False,
+    )
+    torch.testing.assert_close(actions, torch.full((2, 6), 0.3))
+
+
+def test_td3_get_model_wires_actor_residual():
+    from rlinf.models.embodiment.mlp_policy import get_model as get_mlp_model
+
+    cfg = OmegaConf.create(
+        {
+            "model_type": "rlt_td3_mlp_policy",
+            "z_dim": 8,
+            "proprio_dim": 4,
+            "action_dim": 2,
+            "num_action_chunks": 3,
+            "actor_residual": True,
+            "actor_noise_sigma": 0.0,
+        }
+    )
+    model = get_mlp_model(cfg)
+    assert model.actor.residual is True
 
 
 def _songling_eval_wrapper() -> OpenPiPytorchEvalActionModel:

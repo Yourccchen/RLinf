@@ -15,14 +15,20 @@ stage1_sft_config: examples/sft/config/songling_bfjm_rlt_stage1_sft_openpi_pi05.
 
 device: ${oc.env:SONGLING_RLT_DEVICE,cuda}
 reference_seed: 2026
-# Null keeps a random Stage2 policy. Otherwise a step_N directory that
-# contains learner.pt and replay/, e.g. results/songling_rlt_sseval_td3/checkpoints/step_1
-# N is the TD3 update_step stored in learner.pt.
+# Null keeps a random Stage2 policy. A step_N directory restores learner.pt
+# and replay/. Mutually exclusive with replay_checkpoint.
 actor_checkpoint: null
-# Every N TD3 update_step (critic gradient steps). 0 disables auto-save.
-# 1 dumps after each update once replay has reached min_buffer_size.
-save_interval: 10
+# Reuse labeled chunks without restoring actor/critic weights. A step_N
+# directory loads replay/ only, then runs (n - min_buffer_size + 1) * utd
+# critic updates and writes save_interval checkpoints under this run's
+# timestamp folder. Null skips restore.
+replay_checkpoint: results/songling_rlt_sseval_td3/checkpoints/step_1700
+# Every N TD3 critic updates. 0 disables auto-save. 500 is about 100 new
+# C=50 chunks at UTD 5, roughly 10 episodes if each episode has ~10 chunks.
+save_interval: 500
 # Relative paths resolve against the RLinf repo root, not the RWI cwd.
+# Each Policy start writes save_dir/<YYYYMMDD_HHMMSS>/step_N and does not
+# overwrite an older run's step_N, including replay_checkpoint.
 save_dir: results/songling_rlt_sseval_td3/checkpoints
 
 action_codec:
@@ -48,15 +54,20 @@ actor_model:
   add_value_head: false
   add_q_head: true
   q_head_type: default
-  mlp_hidden_dim: 256
+  mlp_hidden_dim: 1024
   mlp_num_hidden_layers: 2
+  # Residual actor: execute clamp(VLA_ref + mlp). Last layer starts at 0 so
+  # an untrained policy copies the VLA chunk. Do not load a previous
+  # direct-reconstruction learner.pt; replay_checkpoint is still valid.
+  actor_residual: true
   actor_noise_sigma: 0.1
   ref_action_dropout: 0.5
   is_lora: false
 
 learner:
-  batch_size: 8
-  min_buffer_size: 8
+  # One sample is a C=50 chunk (~5x a C=10 transition in env steps).
+  batch_size: 64
+  min_buffer_size: 200
   replay_capacity: 50000
   utd: 5
   gamma: 0.99
@@ -69,11 +80,11 @@ learner:
   reference_dropout_prob: 0.5
   target_action_noise: true
   actor_update_action_noise: true
-  warmup_updates: 100
+  warmup_updates: 1000
   warmup_bc_weight: 7.0
   warmup_q_weight: 0.05
   online_bc_weight: 2.8
   online_q_weight: 0.5
-  ramp_updates: 20000
+  ramp_updates: 5000
   queue_size: 1024
   seed: 1234

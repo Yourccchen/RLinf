@@ -184,3 +184,9 @@ class TransitionFeedback:
     def done(self) -> bool:
         valid = self.valid_step_mask
         return bool((self.terminated[valid] | self.truncated[valid]).any())
+
+    @property
+    def has_labeled_outcome(self) -> bool:
+        """True when success/failure terminated the episode, not abort."""
+        valid = self.valid_step_mask
+        return bool(self.terminated[valid].any())

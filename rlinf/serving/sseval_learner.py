@@ -7,6 +7,7 @@ from __future__ import annotations
 import copy
 import queue
 import threading
+import time
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Mapping
@@ -14,12 +15,46 @@ from typing import Any, Mapping
 import torch
 import torch.nn.functional as F
 
+from rlinf.algorithms.rlt.transition import overwrite_rlt_ref_with_human
 from rlinf.data.schema.embodied_types import Trajectory
 from rlinf.data.storage.replay import TrajectoryReplayBuffer
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.utils.logging import get_logger
 
 logger = get_logger()
+
+
+def make_sseval_run_save_dir(save_dir: str | Path, *, stamp: str | None = None) -> Path:
+    """Create a unique timestamped run directory under ``save_dir``.
+
+    Autosave writes ``<save_dir>/<YYYYMMDD_HHMMSS>/step_N`` so a new Policy
+    process cannot overwrite an earlier run's ``step_N``.
+    """
+    root = Path(save_dir).expanduser()
+    stamp = stamp or time.strftime("%Y%m%d_%H%M%S")
+    path = root / stamp
+    suffix = 1
+    while path.exists():
+        path = root / f"{stamp}_{suffix}"
+        suffix += 1
+    path.mkdir(parents=True, exist_ok=False)
+    return path
+
+
+def replay_catch_up_updates(num_samples: int, *, min_buffer_size: int, utd: int) -> int:
+    """Return critic updates implied by live ``min_buffer_size`` + ``utd`` collection.
+
+    Live collection trains only after the buffer reaches ``min_buffer_size``.
+    Each later transition runs ``utd`` critic updates. Loading replay files
+    skips that loop, so restore uses the same count:
+    ``(n - min_buffer_size + 1) * utd`` when ``n >= min_buffer_size``.
+    """
+    samples = int(num_samples)
+    threshold = int(min_buffer_size)
+    ratio = int(utd)
+    if samples < threshold or threshold <= 0 or ratio <= 0:
+        return 0
+    return (samples - threshold + 1) * ratio
 
 
 @dataclass(frozen=True)
@@ -98,7 +133,13 @@ class InProcessRLTTD3Learner:
             raise ValueError(f"save_interval must be >= 0, got {self.save_interval}.")
         if self.save_interval > 0 and not save_dir:
             raise ValueError("save_dir is required when save_interval > 0.")
-        self.save_dir = Path(save_dir).expanduser() if save_dir else None
+        if save_dir and self.save_interval > 0:
+            self.save_dir = make_sseval_run_save_dir(save_dir)
+            logger.info("SsEval checkpoints will be written under %s", self.save_dir)
+        elif save_dir:
+            self.save_dir = Path(save_dir).expanduser()
+        else:
+            self.save_dir = None
         self._last_saved_step = 0
         self.model = model
         self.device = next(model.parameters()).device
@@ -174,6 +215,7 @@ class InProcessRLTTD3Learner:
 
     def add_and_train(self, trajectory: Trajectory) -> None:
         with self._train_lock:
+            self._write_human_actions_into_ref(trajectory)
             self.replay.add_trajectories([trajectory])
             self.total_transitions += int(trajectory.rewards.shape[0])
             if self.replay.total_samples < self.config.min_buffer_size:
@@ -198,8 +240,24 @@ class InProcessRLTTD3Learner:
         q = cfg.warmup_q_weight + progress * (cfg.online_q_weight - cfg.warmup_q_weight)
         return bc, q
 
+    @staticmethod
+    def _write_human_actions_into_ref(trajectory: Trajectory) -> None:
+        obs = trajectory.curr_obs
+        if obs is None or "ref_chunk" not in obs:
+            return
+        obs["ref_chunk"] = overwrite_rlt_ref_with_human(
+            obs["ref_chunk"],
+            trajectory.actions,
+            trajectory.intervene_flags,
+        )
+
     def train_once(self) -> dict[str, float]:
         batch = _to_device(self.replay.sample(self.config.batch_size), self.device)
+        batch["curr_obs"]["ref_chunk"] = overwrite_rlt_ref_with_human(
+            batch["curr_obs"]["ref_chunk"],
+            batch["actions"],
+            batch.get("intervene_flags"),
+        )
         rewards = batch["rewards"].reshape(self.config.batch_size, -1).float()
         valid = batch["forward_inputs"]["valid_step_mask"].reshape_as(rewards).bool()
         steps = torch.arange(rewards.shape[-1], device=self.device, dtype=rewards.dtype)
@@ -399,6 +457,55 @@ class InProcessRLTTD3Learner:
             self.replay.load_checkpoint(str(root / "replay"))
             self._last_saved_step = self.update_step
             self._publish_candidate(self.update_step)
+
+    def load_replay(self, path: str | Path) -> None:
+        """Load replay files and catch up the live ``min_buffer_size`` + ``utd`` count.
+
+        Does not read ``learner.pt``. Actor, critic, and optimizer stay at
+        their current initialization; ``update_step`` starts at 0, then
+        catch-up trains the live collection count. Checkpoints are written
+        under the timestamped run directory at ``save_interval``, same as
+        live collection.
+        """
+        self.wait_idle()
+        root = Path(path)
+        if not (root / "metadata.json").is_file():
+            raise ValueError(f"replay checkpoint {root} is missing metadata.json.")
+        with self._train_lock:
+            self.replay.clear()
+            self.replay.load_checkpoint(str(root))
+            self.total_transitions = int(self.replay.total_samples)
+            self.update_step = 0
+            self._last_saved_step = 0
+            self._candidate_actor_state = None
+            self._candidate_version = None
+            self._catch_up_from_replay()
+
+    def _catch_up_from_replay(self) -> None:
+        samples = int(self.replay.total_samples)
+        updates = replay_catch_up_updates(
+            samples,
+            min_buffer_size=self.config.min_buffer_size,
+            utd=self.config.utd,
+        )
+        if updates <= 0:
+            logger.info(
+                "Replay has %s samples < min_buffer_size %s; skipping catch-up.",
+                samples,
+                self.config.min_buffer_size,
+            )
+            return
+        logger.info(
+            "Catching up %s TD3 updates from %s replay samples "
+            "(min_buffer_size=%s, utd=%s).",
+            updates,
+            samples,
+            self.config.min_buffer_size,
+            self.config.utd,
+        )
+        for _ in range(updates):
+            self.train_once()
+            self._maybe_save()
 
     def close(self) -> None:
         if self._closed:

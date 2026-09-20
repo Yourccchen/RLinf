@@ -41,8 +41,28 @@ def _make_td3_mlp(
     return nn.Sequential(OrderedDict([("net", nn.Sequential(*layers))]))
 
 
+def _zero_init_last_linear(module: nn.Module) -> None:
+    last = None
+    for child in module.modules():
+        if isinstance(child, nn.Linear):
+            last = child
+    if last is None:
+        raise ValueError("Cannot zero-init an MLP that has no Linear layer.")
+    nn.init.zeros_(last.weight)
+    if last.bias is not None:
+        nn.init.zeros_(last.bias)
+
+
 class DirectGaussianActor(nn.Module):
-    """Direct TD3-style actor conditioned on RLT state and reference chunk."""
+    """TD3 actor over RLT state and the VLA reference chunk.
+
+    Direct mode reconstructs the absolute chunk. Residual mode predicts a
+    correction added to the undropped reference, so the executed chunk is
+    ``clamp(a_tilde + mlp(...))``. Residual last-layer weights start at zero,
+    which copies the VLA chunk until training learns a correction. Reference
+    dropout still zeros the MLP input only; the skip connection always uses
+    the original ``a_tilde``.
+    """
 
     def __init__(
         self,
@@ -52,16 +72,20 @@ class DirectGaussianActor(nn.Module):
         num_hidden_layers: int = 2,
         sigma: float = 0.1,
         ref_dropout: float = 0.0,
+        residual: bool = False,
     ) -> None:
         super().__init__()
         self.sigma = float(sigma)
         self.ref_dropout = float(ref_dropout)
+        self.residual = bool(residual)
         self.mlp = _make_td3_mlp(
             input_dim=int(state_dim) + int(action_chunk_dim),
             output_dim=int(action_chunk_dim),
             hidden_dim=int(hidden_dim),
             num_hidden_layers=int(num_hidden_layers),
         )
+        if self.residual:
+            _zero_init_last_linear(self.mlp)
 
     def _drop_reference(
         self,
@@ -89,12 +113,13 @@ class DirectGaussianActor(nn.Module):
         if apply_action_noise is None:
             apply_action_noise = not deterministic
 
-        reference = (
+        mlp_ref = (
             self._drop_reference(a_tilde, ref_dropout=ref_dropout)
             if apply_ref_dropout
             else a_tilde
         )
-        action = self.mlp(torch.cat([x, reference], dim=-1))
+        output = self.mlp(torch.cat([x, mlp_ref], dim=-1))
+        action = a_tilde + output if self.residual else output
         if apply_action_noise and self.sigma > 0.0:
             action = action + torch.randn_like(action) * self.sigma
         return action.clamp(-1.0, 1.0)
@@ -171,6 +196,7 @@ class RLTTD3MLPPolicy(nn.Module, BasePolicy):
         mlp_num_hidden_layers: int = 2,
         actor_noise_sigma: float = 0.1,
         ref_action_dropout: float = 0.0,
+        actor_residual: bool = False,
     ) -> None:
         super().__init__()
         if not add_q_head:
@@ -209,6 +235,7 @@ class RLTTD3MLPPolicy(nn.Module, BasePolicy):
             num_hidden_layers=mlp_num_hidden_layers,
             sigma=actor_noise_sigma,
             ref_dropout=ref_action_dropout,
+            residual=actor_residual,
         )
         # Name this q_head so existing SAC/RLT optimizer filtering keeps actor
         # and critic optimizers separate.

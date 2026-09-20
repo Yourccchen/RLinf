@@ -18,11 +18,16 @@ from rlinf.serving.sseval_contract import (
 from rlinf.serving.sseval_learner import (
     InProcessLearnerConfig,
     InProcessRLTTD3Learner,
+    make_sseval_run_save_dir,
+    replay_catch_up_updates,
 )
 from rlinf.serving.sseval_runtime import (
     SsEvalRLTRuntime,
     align_feature_model_from_sft_config,
+    apply_sseval_restore,
     resolve_sseval_checkpoint_dir,
+    resolve_sseval_replay_dir,
+    sseval_replay_weights_id,
 )
 
 
@@ -74,17 +79,33 @@ def _observation(value=0.0):
     }
 
 
-def _feedback(chunk_id=0, *, done=False, mode="actor"):
+def _feedback(
+    chunk_id=0,
+    *,
+    done=False,
+    truncated=False,
+    mode="actor",
+    reward=0.0,
+    episode_id="episode-1",
+):
+    rewards = np.zeros(CHUNK_LEN, dtype=np.float32)
+    terminated = np.zeros(CHUNK_LEN, dtype=bool)
+    trunc = np.zeros(CHUNK_LEN, dtype=bool)
+    if done:
+        terminated[-1] = True
+        rewards[-1] = float(reward)
+    if truncated:
+        trunc[-1] = True
     return {
         "rlt_protocol_version": RLT_SSEVAL_PROTOCOL_VERSION,
-        "episode_id": "episode-1",
+        "episode_id": episode_id,
         "chunk_id": chunk_id,
         "selected_mode": mode,
         "executed_actions": np.full((CHUNK_LEN, ACTION_DIM), 0.5, dtype=np.float32),
         "valid_step_mask": np.ones(CHUNK_LEN, dtype=bool),
-        "rewards": np.zeros(CHUNK_LEN, dtype=np.float32),
-        "terminated": np.array([False] * (CHUNK_LEN - 1) + [done]),
-        "truncated": np.zeros(CHUNK_LEN, dtype=bool),
+        "rewards": rewards,
+        "terminated": terminated,
+        "truncated": trunc,
         "intervene_flags": np.full(CHUNK_LEN, mode == "human", dtype=bool),
         "rlt_switch_flags": np.ones(CHUNK_LEN, dtype=bool),
         "actor_version": 0,
@@ -116,7 +137,7 @@ def test_runtime_inference_does_not_autosave():
     assert learner.saved == []
 
 
-def _offline_rlt_trajectory(chunk_len: int = 10):
+def _offline_rlt_trajectory(chunk_len: int = 10, model_weights_id: str = "offline"):
     features = [
         {
             "z_rl": torch.zeros(8),
@@ -132,7 +153,11 @@ def _offline_rlt_trajectory(chunk_len: int = 10):
         "truncated": torch.zeros(chunk_len, dtype=torch.bool),
     }
     return build_offline_rlt_trajectories(
-        episode, features, chunk_len=chunk_len, transition_stride=chunk_len
+        episode,
+        features,
+        chunk_len=chunk_len,
+        transition_stride=chunk_len,
+        model_weights_id=model_weights_id,
     )[0]
 
 
@@ -166,24 +191,49 @@ def test_learner_autosaves_every_save_interval_update_steps(tmp_path):
     learner.add_and_train(trajectory)
     learner.add_and_train(trajectory)
 
-    assert (tmp_path / "step_2" / "learner.pt").is_file()
-    assert (tmp_path / "step_4" / "learner.pt").is_file()
-    assert not (tmp_path / "step_1").exists()
-    assert not (tmp_path / "step_3").exists()
+    run_dir = learner.save_dir
+    assert run_dir is not None
+    assert run_dir.parent == tmp_path
+    assert (run_dir / "step_2" / "learner.pt").is_file()
+    assert (run_dir / "step_4" / "learner.pt").is_file()
+    assert not (run_dir / "step_1").exists()
+    assert not (run_dir / "step_3").exists()
+    assert not (tmp_path / "step_2").exists()
     learner.close()
 
 
 def test_learner_close_force_saves_remainder(tmp_path):
     learner = _td3_learner(save_interval=5, save_dir=tmp_path, utd=2)
     learner.add_and_train(_offline_rlt_trajectory())
-    assert not (tmp_path / "step_2").exists()
+    run_dir = learner.save_dir
+    assert run_dir is not None
+    assert not (run_dir / "step_2").exists()
 
     learner.close()
 
-    assert (tmp_path / "step_2" / "learner.pt").is_file()
+    assert (run_dir / "step_2" / "learner.pt").is_file()
+    assert not (tmp_path / "step_2").exists()
 
 
-def test_runtime_emits_candidates_and_ingests_executed_feedback():
+def test_make_sseval_run_save_dir_nests_timestamp_and_avoids_collision(tmp_path):
+    first = make_sseval_run_save_dir(tmp_path, stamp="20260920_153000")
+    second = make_sseval_run_save_dir(tmp_path, stamp="20260920_153000")
+    assert first == tmp_path / "20260920_153000"
+    assert second == tmp_path / "20260920_153000_1"
+    assert first.is_dir() and second.is_dir()
+
+
+def test_sseval_replay_weights_id_sanitizes_episode_and_names_mode():
+    assert sseval_replay_weights_id("episode-1", 0, "actor") == (
+        "ep-episode-1_chunk-0_actor"
+    )
+    assert sseval_replay_weights_id("sess/foo bar", 3, "vla") == (
+        "ep-sess-foo-bar_chunk-3_vla"
+    )
+    assert sseval_replay_weights_id("///", 0, "human") == "ep-episode_chunk-0_human"
+
+
+def test_runtime_emits_candidates_and_holds_feedback_until_outcome():
     runtime, learner = _runtime()
     runtime.start_episode("episode-1", "fold clothes")
     first = runtime.infer_candidates(_observation(0.0))
@@ -194,13 +244,22 @@ def test_runtime_emits_candidates_and_ingests_executed_feedback():
     assert second.chunk_id == 1
     assert first.vla_action.shape == (CHUNK_LEN, ACTION_DIM)
     assert first.actor_action.shape == (CHUNK_LEN, ACTION_DIM)
-    assert len(learner.submitted) == 1
+    assert learner.submitted == []
+
+    runtime.end_episode(_feedback(1, done=True, reward=1.0))
+
+    assert len(learner.submitted) == 2
     trajectory = learner.submitted[0]
+    assert trajectory.model_weights_id == "ep-episode-1_chunk-0_actor"
+    assert learner.submitted[1].model_weights_id == "ep-episode-1_chunk-1_actor"
     torch.testing.assert_close(
         trajectory.actions.reshape(CHUNK_LEN, ACTION_DIM),
         torch.full((CHUNK_LEN, ACTION_DIM), 0.5),
     )
     assert trajectory.forward_inputs["actor_switch"].all()
+    assert not trajectory.terminations.any()
+    assert learner.submitted[1].terminations.any()
+    assert learner.submitted[1].rewards.reshape(-1)[-1] == 1.0
 
 
 def test_runtime_rejects_out_of_order_feedback():
@@ -283,10 +342,93 @@ def test_terminal_feedback_closes_runtime_episode():
     runtime, learner = _runtime()
     runtime.start_episode("episode-1", "fold clothes")
     runtime.infer_candidates(_observation())
-    runtime.infer_candidates(_observation(1.0), _feedback(0, done=True))
+    runtime.infer_candidates(_observation(1.0), _feedback(0, done=True, reward=1.0))
     assert len(learner.submitted) == 1
+    assert learner.submitted[0].terminations.any()
     with pytest.raises(RuntimeError, match="start_episode"):
         runtime.infer_candidates(_observation(2.0))
+
+
+def test_runtime_commits_failure_episode_to_replay():
+    runtime, learner = _runtime()
+    runtime.start_episode("episode-1", "fold clothes")
+    runtime.infer_candidates(_observation(0.0))
+    runtime.infer_candidates(_observation(1.0), _feedback(0))
+    runtime.end_episode(_feedback(1, done=True, reward=0.0))
+
+    assert len(learner.submitted) == 2
+    assert learner.submitted[-1].terminations.any()
+    assert not learner.submitted[-1].truncations.any()
+    assert learner.submitted[-1].rewards.reshape(-1)[-1] == 0.0
+
+
+def test_human_feedback_writes_executed_actions_into_ref_chunk():
+    runtime, learner = _runtime()
+    runtime.start_episode("episode-1", "fold clothes")
+    runtime.infer_candidates(_observation(0.0))
+    runtime.infer_candidates(_observation(1.0), _feedback(0, mode="human"))
+    runtime.end_episode(_feedback(1, done=True, reward=1.0, mode="human"))
+
+    assert len(learner.submitted) == 2
+    for trajectory in learner.submitted:
+        flags = trajectory.intervene_flags.reshape(-1)
+        assert flags.all()
+        ref = trajectory.curr_obs["ref_chunk"].reshape(-1, ACTION_DIM)
+        act = trajectory.actions.reshape(-1, ACTION_DIM)
+        torch.testing.assert_close(ref, act)
+        assert torch.allclose(ref, torch.full_like(ref, 0.5))
+
+
+def test_actor_feedback_keeps_vla_ref_chunk():
+    runtime, learner = _runtime()
+    runtime.start_episode("episode-1", "fold clothes")
+    runtime.infer_candidates(_observation(0.0))
+    runtime.infer_candidates(_observation(1.0), _feedback(0, mode="actor"))
+    runtime.end_episode(_feedback(1, done=True, reward=1.0, mode="actor"))
+
+    assert len(learner.submitted) == 2
+    for trajectory in learner.submitted:
+        assert not trajectory.intervene_flags.any()
+        ref = trajectory.curr_obs["ref_chunk"].reshape(-1)
+        assert torch.count_nonzero(ref) == 0
+
+
+def test_runtime_drops_truncated_episode():
+    runtime, learner = _runtime()
+    runtime.start_episode("episode-1", "fold clothes")
+    runtime.infer_candidates(_observation(0.0))
+    runtime.infer_candidates(_observation(1.0), _feedback(0, mode="human"))
+    runtime.end_episode(_feedback(1, truncated=True, mode="human"))
+
+    assert learner.submitted == []
+    with pytest.raises(RuntimeError, match="start_episode"):
+        runtime.infer_candidates(_observation(2.0))
+
+
+def test_runtime_drops_truncated_feedback_on_next_observation():
+    runtime, learner = _runtime()
+    runtime.start_episode("episode-1", "fold clothes")
+    runtime.infer_candidates(_observation())
+    runtime.infer_candidates(_observation(1.0), _feedback(0, truncated=True))
+
+    assert learner.submitted == []
+    with pytest.raises(RuntimeError, match="start_episode"):
+        runtime.infer_candidates(_observation(2.0))
+
+
+def test_runtime_drops_unscored_buffer_on_reset_and_close():
+    runtime, learner = _runtime()
+    runtime.start_episode("episode-1", "fold clothes")
+    runtime.infer_candidates(_observation(0.0))
+    runtime.infer_candidates(_observation(1.0), _feedback(0))
+    runtime.reset()
+
+    assert learner.submitted == []
+    runtime.start_episode("episode-2", "fold clothes")
+    runtime.infer_candidates(_observation(0.0))
+    runtime.infer_candidates(_observation(1.0), _feedback(0, episode_id="episode-2"))
+    runtime.close()
+    assert learner.submitted == []
 
 
 def test_in_process_learner_checkpoint_round_trip(tmp_path):
@@ -419,6 +561,189 @@ def test_runtime_loads_step_directory_checkpoint(tmp_path):
         torch.testing.assert_close(
             restored.active_policy_model.state_dict()[key].cpu(), value
         )
+    first.close()
+    restored.close()
+
+
+def test_replay_catch_up_updates_matches_live_collection():
+    assert replay_catch_up_updates(199, min_buffer_size=200, utd=5) == 0
+    assert replay_catch_up_updates(200, min_buffer_size=200, utd=5) == 5
+    assert replay_catch_up_updates(499, min_buffer_size=200, utd=5) == 1500
+
+
+def test_resolve_sseval_replay_dir_accepts_step_or_replay_folder(tmp_path):
+    step_dir = tmp_path / "step_1500"
+    replay_dir = step_dir / "replay"
+    replay_dir.mkdir(parents=True)
+    (replay_dir / "metadata.json").write_text("{}", encoding="utf-8")
+    assert resolve_sseval_replay_dir(step_dir) == replay_dir.resolve()
+    assert resolve_sseval_replay_dir(replay_dir) == replay_dir.resolve()
+    empty = tmp_path / "step_1"
+    empty.mkdir()
+    with pytest.raises(ValueError, match="metadata.json"):
+        resolve_sseval_replay_dir(empty)
+
+
+def test_apply_sseval_restore_rejects_actor_and_replay_together():
+    runtime, _ = _runtime()
+    cfg = OmegaConf.create(
+        {
+            "actor_checkpoint": "results/ckpts/step_1",
+            "replay_checkpoint": "results/ckpts/step_2",
+        }
+    )
+    with pytest.raises(ValueError, match="cannot both be set"):
+        apply_sseval_restore(runtime, cfg, Path("unused.yaml"))
+
+
+def _catch_up_learner(*, min_buffer_size, utd=2, save_interval=0, save_dir=None):
+    model = RLTTD3MLPPolicy(
+        z_dim=8,
+        proprio_dim=14,
+        action_dim=14,
+        num_action_chunks=10,
+        actor_noise_sigma=0.0,
+    )
+    return InProcessRLTTD3Learner(
+        model,
+        InProcessLearnerConfig(
+            batch_size=1,
+            min_buffer_size=min_buffer_size,
+            replay_capacity=8,
+            utd=utd,
+            actor_update_interval=2,
+            warmup_updates=100,
+        ),
+        start_background=False,
+        save_interval=save_interval,
+        save_dir=save_dir,
+    )
+
+
+def test_load_replay_catches_up_without_loading_actor(tmp_path):
+    first = _catch_up_learner(min_buffer_size=3, utd=2)
+    for index in range(5):
+        first.add_and_train(_offline_rlt_trajectory(model_weights_id=f"t{index}"))
+    step_dir = tmp_path / "step_6"
+    first.save_checkpoint(step_dir)
+    saved_actor = {
+        key: value.detach().cpu().clone()
+        for key, value in first.model.actor.state_dict().items()
+    }
+    (step_dir / "learner.pt").unlink()
+
+    restored = _catch_up_learner(
+        min_buffer_size=3, utd=2, save_interval=2, save_dir=tmp_path / "caught"
+    )
+    init_actor = {
+        key: value.detach().cpu().clone()
+        for key, value in restored.model.actor.state_dict().items()
+    }
+    restored.load_replay(step_dir / "replay")
+
+    assert restored.replay.total_samples == 5
+    assert restored.total_transitions == 5
+    assert restored.update_step == replay_catch_up_updates(5, min_buffer_size=3, utd=2)
+    assert restored.update_step == 6
+    assert any(
+        not torch.allclose(restored.model.actor.state_dict()[key], saved_actor[key])
+        for key in saved_actor
+    )
+    assert any(
+        not torch.equal(restored.model.actor.state_dict()[key], init_actor[key])
+        for key in init_actor
+    )
+    run_dir = restored.save_dir
+    assert run_dir is not None
+    assert run_dir.parent == tmp_path / "caught"
+    assert (run_dir / "step_2" / "learner.pt").is_file()
+    assert (run_dir / "step_4" / "learner.pt").is_file()
+    assert (run_dir / "step_6" / "learner.pt").is_file()
+    assert not (run_dir / "step_1").exists()
+    first.close()
+    restored.close()
+
+
+def test_load_replay_skips_catch_up_below_min_buffer(tmp_path):
+    first = _catch_up_learner(min_buffer_size=1, utd=2)
+    first.add_and_train(_offline_rlt_trajectory())
+    step_dir = tmp_path / "step_2"
+    first.save_checkpoint(step_dir)
+
+    restored = _catch_up_learner(min_buffer_size=5, utd=2)
+    init_actor = {
+        key: value.detach().cpu().clone()
+        for key, value in restored.model.actor.state_dict().items()
+    }
+    restored.load_replay(step_dir / "replay")
+
+    assert restored.replay.total_samples == 1
+    assert restored.update_step == 0
+    assert not restored.actor_ready
+    for key, value in init_actor.items():
+        torch.testing.assert_close(restored.model.actor.state_dict()[key], value)
+    first.close()
+    restored.close()
+
+
+def test_runtime_load_replay_keeps_fresh_actor(tmp_path):
+    def make_runtime():
+        policy = RLTTD3MLPPolicy(
+            z_dim=8,
+            proprio_dim=14,
+            action_dim=14,
+            num_action_chunks=10,
+            actor_noise_sigma=0.0,
+        )
+        learner = InProcessRLTTD3Learner(
+            copy.deepcopy(policy).train().requires_grad_(True),
+            InProcessLearnerConfig(
+                batch_size=1,
+                min_buffer_size=1,
+                replay_capacity=8,
+                utd=2,
+                actor_update_interval=2,
+                warmup_updates=2,
+            ),
+            start_background=False,
+        )
+        return SsEvalRLTRuntime(
+            feature_model=FakeFeatureModel(),
+            active_policy_model=policy,
+            action_codec=SonglingActionCodec([-1.0] * 14, [1.0] * 14),
+            learner=learner,
+            chunk_len=10,
+        )
+
+    first = make_runtime()
+    first.learner.add_and_train(_offline_rlt_trajectory())
+    step_dir = tmp_path / "step_2"
+    first.save_checkpoint(step_dir)
+    saved = {
+        key: value.detach().cpu().clone()
+        for key, value in first.learner.model.state_dict().items()
+    }
+
+    restored = make_runtime()
+    init_actor = {
+        key: value.detach().cpu().clone()
+        for key, value in restored.active_policy_model.actor.state_dict().items()
+    }
+    restored.load_replay_checkpoint(step_dir)
+
+    assert restored.learner.update_step == 2
+    assert restored.learner.replay.total_samples == 1
+    assert restored.active_actor_version == 2
+    assert not all(
+        torch.allclose(restored.active_policy_model.state_dict()[key].cpu(), value)
+        for key, value in saved.items()
+    )
+    assert any(
+        not torch.equal(
+            restored.active_policy_model.actor.state_dict()[key].cpu(), init_actor[key]
+        )
+        for key in init_actor
+    )
     first.close()
     restored.close()
 

@@ -52,6 +52,34 @@ def use_rlt_transition_replay(cfg: Any) -> bool:
         return False
 
 
+def overwrite_rlt_ref_with_human(
+    ref_chunk: torch.Tensor,
+    actions: torch.Tensor,
+    intervene_flags: torch.Tensor | None,
+) -> torch.Tensor:
+    """Replace VLA reference steps with executed human actions.
+
+    On intervene steps the actor must condition on the trajectory that ran,
+    not the VLA proposal from inference time. No-ops when ``intervene_flags``
+    is missing or all false, so VLA/actor chunks keep their original ref.
+    """
+    if intervene_flags is None or not bool(intervene_flags.any()):
+        return ref_chunk
+    batch_size = int(ref_chunk.shape[0])
+    flags = intervene_flags.reshape(batch_size, -1, 1).to(
+        device=ref_chunk.device, dtype=torch.bool
+    )
+    human_actions = actions.reshape(batch_size, flags.shape[1], -1)
+    action_dim = human_actions.shape[-1]
+    ref_actions = ref_chunk.reshape(batch_size, -1, action_dim).clone()
+    ref_actions[:, : flags.shape[1]] = torch.where(
+        flags,
+        human_actions.to(device=ref_chunk.device, dtype=ref_chunk.dtype),
+        ref_actions[:, : flags.shape[1]],
+    )
+    return ref_actions.reshape_as(ref_chunk)
+
+
 def extract_rlt_obs_from_forward_inputs(
     forward_inputs: dict[str, Any],
     *,
@@ -87,20 +115,11 @@ def update_rlt_transitions(
     if pending_obs[stage_id] is not None:
         if intervene_actions is not None and intervene_flags is not None:
             current_obs = pending_obs[stage_id]
-            ref_chunk = current_obs["ref_chunk"]
-            batch_size = ref_chunk.shape[0]
-            flags = intervene_flags.reshape(batch_size, -1, 1).to(
-                device=ref_chunk.device, dtype=torch.bool
+            current_obs["ref_chunk"] = overwrite_rlt_ref_with_human(
+                current_obs["ref_chunk"],
+                intervene_actions,
+                intervene_flags,
             )
-            human_actions = intervene_actions.reshape(batch_size, flags.shape[1], -1)
-            action_dim = human_actions.shape[-1]
-            ref_actions = ref_chunk.reshape(batch_size, -1, action_dim).clone()
-            ref_actions[:, : flags.shape[1]] = torch.where(
-                flags,
-                human_actions.to(device=ref_chunk.device, dtype=ref_chunk.dtype),
-                ref_actions[:, : flags.shape[1]],
-            )
-            current_obs["ref_chunk"] = ref_actions.reshape_as(ref_chunk)
         next_obs = extract_rlt_obs_from_forward_inputs(
             policy_output.forward_inputs,
             transition=True,

@@ -27,6 +27,17 @@ not share the Stage1 SFT assets path, so the Stage1 checkpoint and
 training. Point `stage1_sft_config` at the YAML used for the Stage1 run so
 train and serve stay aligned without duplicating the frozen Stage1 fields.
 
+`actor_checkpoint` restores learner weights, optimizer, `update_step`, and
+replay from a `step_N` directory. `replay_checkpoint` loads only `replay/`
+(the `step_N` directory or the `replay/` folder itself), leaves the Stage2
+actor randomly initialized, then runs `(n - min_buffer_size + 1) * utd`
+critic updates so the new actor sees the same update count as live
+collection. Catch-up checkpoints use the same ``save_interval`` under the
+timestamped run directory. The two keys cannot be set together. Autosave writes
+``save_dir/<YYYYMMDD_HHMMSS>/step_N`` so a new Policy run cannot overwrite
+an earlier ``step_N``, including the directory named by
+``replay_checkpoint``.
+
 To change the execute chunk length later, change Stage1
 ``actor.model.num_action_chunks`` (and retrain that checkpoint). Align copies
 it onto the serving VLA and actor; Policy hello reports it as

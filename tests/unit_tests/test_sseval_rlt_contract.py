@@ -90,7 +90,16 @@ def test_feedback_validates_mode_and_terminal_state():
     feedback = TransitionFeedback.from_mapping(payload)
     assert feedback.selected_mode is SelectedMode.HUMAN
     assert feedback.done
+    assert feedback.has_labeled_outcome
     assert feedback.key == ("episode-1", 3)
+
+
+def test_truncated_feedback_is_done_without_labeled_outcome():
+    payload = _feedback("actor")
+    payload["truncated"][-1] = True
+    feedback = TransitionFeedback.from_mapping(payload)
+    assert feedback.done
+    assert not feedback.has_labeled_outcome
 
 
 def test_feedback_rejects_human_actions_without_intervention_flags():
