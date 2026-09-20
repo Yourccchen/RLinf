@@ -73,6 +73,8 @@ class InProcessLearnerConfig:
     reference_dropout_prob: float = 0.5
     target_action_noise: bool = True
     actor_update_action_noise: bool = True
+    residual_velocity_weight: float = 0.0
+    residual_acceleration_weight: float = 0.0
     warmup_updates: int = 5000
     warmup_bc_weight: float = 7.0
     warmup_q_weight: float = 0.05
@@ -100,7 +102,54 @@ class InProcessLearnerConfig:
         ):
             if int(getattr(result, name)) <= 0:
                 raise ValueError(f"{name} must be positive.")
+        for name in (
+            "residual_velocity_weight",
+            "residual_acceleration_weight",
+        ):
+            if float(getattr(result, name)) < 0:
+                raise ValueError(f"{name} must be non-negative.")
         return result
+
+
+def residual_temporal_losses(
+    predicted_chunk: torch.Tensor,
+    reference_chunk: torch.Tensor,
+    valid_step_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return first/second-order smoothness losses on the effective residual."""
+    if predicted_chunk.shape != reference_chunk.shape:
+        raise ValueError(
+            "predicted/reference chunks must match, got "
+            f"{predicted_chunk.shape} and {reference_chunk.shape}."
+        )
+    if predicted_chunk.ndim != 3:
+        raise ValueError(
+            f"action chunks must be [B,C,A], got {predicted_chunk.shape}."
+        )
+    valid = valid_step_mask.to(
+        device=predicted_chunk.device, dtype=torch.bool
+    ).reshape(predicted_chunk.shape[0], predicted_chunk.shape[1])
+    residual = predicted_chunk - reference_chunk
+    zero = residual.sum() * 0.0
+
+    if residual.shape[1] < 2:
+        return zero, zero
+    velocity_error = (residual[:, 1:] - residual[:, :-1]).square().mean(dim=-1)
+    velocity_mask = valid[:, 1:] & valid[:, :-1]
+    velocity_loss = (velocity_error * velocity_mask).sum() / velocity_mask.sum().clamp_min(
+        1
+    )
+
+    if residual.shape[1] < 3:
+        return velocity_loss, zero
+    acceleration_error = (
+        residual[:, 2:] - 2.0 * residual[:, 1:-1] + residual[:, :-2]
+    ).square().mean(dim=-1)
+    acceleration_mask = valid[:, 2:] & valid[:, 1:-1] & valid[:, :-2]
+    acceleration_loss = (
+        acceleration_error * acceleration_mask
+    ).sum() / acceleration_mask.sum().clamp_min(1)
+    return velocity_loss, acceleration_loss
 
 
 def _to_device(value: Any, device: torch.device):
@@ -306,6 +355,9 @@ class InProcessRLTTD3Learner:
         self.critic_optimizer.step()
 
         actor_loss_value = float("nan")
+        residual_velocity_value = float("nan")
+        residual_acceleration_value = float("nan")
+        residual_smoothness_value = float("nan")
         actor_updated = (self.update_step + 1) % self.config.actor_update_interval == 0
         if actor_updated:
             predicted, _, _ = self.model(
@@ -333,7 +385,28 @@ class InProcessRLTTD3Learner:
             bc_error = (predicted_chunk - target).square().mean(dim=-1)
             bc_loss = (bc_error * valid).sum() / valid.sum().clamp_min(1)
             bc_weight, q_weight = self._objective_weights()
-            actor_loss = bc_weight * bc_loss - q_weight * q1.mean()
+
+            # Smooth the deterministic deployment policy, not sampled training noise.
+            smooth_action, _, _ = self.model(
+                forward_type=ForwardType.SAC,
+                obs=batch["curr_obs"],
+                apply_reference_dropout=False,
+                apply_action_noise=False,
+            )
+            smooth_chunk = smooth_action.reshape_as(predicted_chunk)
+            residual_velocity_loss, residual_acceleration_loss = (
+                residual_temporal_losses(smooth_chunk, ref_chunk, valid)
+            )
+            residual_smoothness_loss = (
+                self.config.residual_velocity_weight * residual_velocity_loss
+                + self.config.residual_acceleration_weight
+                * residual_acceleration_loss
+            )
+            actor_loss = (
+                bc_weight * bc_loss
+                - q_weight * q1.mean()
+                + residual_smoothness_loss
+            )
             self.actor_optimizer.zero_grad(set_to_none=True)
             self.critic_optimizer.zero_grad(set_to_none=True)
             actor_loss.backward()
@@ -342,6 +415,15 @@ class InProcessRLTTD3Learner:
             )
             self.actor_optimizer.step()
             actor_loss_value = float(actor_loss.detach().cpu())
+            residual_velocity_value = float(
+                residual_velocity_loss.detach().cpu()
+            )
+            residual_acceleration_value = float(
+                residual_acceleration_loss.detach().cpu()
+            )
+            residual_smoothness_value = float(
+                residual_smoothness_loss.detach().cpu()
+            )
             self._publish_candidate(self.update_step + 1)
         else:
             actor_norm = torch.zeros(())
@@ -353,6 +435,9 @@ class InProcessRLTTD3Learner:
             "critic_grad_norm": float(critic_norm.detach().cpu()),
             "actor_loss": actor_loss_value,
             "actor_grad_norm": float(actor_norm.detach().cpu()),
+            "residual_velocity_loss": residual_velocity_value,
+            "residual_acceleration_loss": residual_acceleration_value,
+            "residual_smoothness_loss": residual_smoothness_value,
             "actor_updated": float(actor_updated),
             "update_step": float(self.update_step),
             "replay_size": float(self.replay.total_samples),

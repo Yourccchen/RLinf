@@ -80,6 +80,9 @@ learner:
   reference_dropout_prob: 0.5
   target_action_noise: true
   actor_update_action_noise: true
+  # Penalize high-frequency residual corrections while preserving the VLA profile.
+  residual_velocity_weight: 50
+  residual_acceleration_weight: 20
   warmup_updates: 1000
   warmup_bc_weight: 7.0
   warmup_q_weight: 0.05

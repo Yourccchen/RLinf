@@ -20,6 +20,7 @@ from rlinf.serving.sseval_learner import (
     InProcessRLTTD3Learner,
     make_sseval_run_save_dir,
     replay_catch_up_updates,
+    residual_temporal_losses,
 )
 from rlinf.serving.sseval_runtime import (
     SsEvalRLTRuntime,
@@ -302,6 +303,8 @@ def test_in_process_learner_runs_utd_and_delays_actor_update():
         replay_capacity=8,
         utd=2,
         actor_update_interval=2,
+        residual_velocity_weight=0.5,
+        residual_acceleration_weight=0.1,
         warmup_updates=2,
     )
     learner = InProcessRLTTD3Learner(model, config, start_background=False)
@@ -334,6 +337,9 @@ def test_in_process_learner_runs_utd_and_delays_actor_update():
     assert learner.update_step == 2
     assert learner.actor_ready
     assert learner.last_metrics["actor_updated"] == 1.0
+    assert learner.last_metrics["residual_velocity_loss"] >= 0.0
+    assert learner.last_metrics["residual_acceleration_loss"] >= 0.0
+    assert learner.last_metrics["residual_smoothness_loss"] >= 0.0
     assert learner.take_candidate() is not None
     learner.close()
 
@@ -910,3 +916,53 @@ def test_align_checked_in_songling_sft_config():
         "songling_bfjm_rlt_stage1_sft_openpi_pi05/global_step_10000/norm_stats.json"
     )
     assert cfg.feature_model.precision == "bf16"
+
+
+def test_residual_temporal_losses_are_zero_for_constant_residual():
+    reference = torch.randn(2, 6, 3)
+    predicted = reference + 0.25
+    valid = torch.ones(2, 6, dtype=torch.bool)
+
+    velocity, acceleration = residual_temporal_losses(
+        predicted, reference, valid
+    )
+
+    torch.testing.assert_close(velocity, torch.zeros_like(velocity))
+    torch.testing.assert_close(acceleration, torch.zeros_like(acceleration))
+
+
+def test_residual_temporal_losses_penalize_alternating_residual():
+    reference = torch.zeros(1, 6, 2)
+    residual = torch.tensor([0.2, -0.2, 0.2, -0.2, 0.2, -0.2]).reshape(
+        1, 6, 1
+    )
+    predicted = reference + residual.expand(-1, -1, 2)
+    valid = torch.ones(1, 6, dtype=torch.bool)
+
+    velocity, acceleration = residual_temporal_losses(
+        predicted, reference, valid
+    )
+
+    assert velocity > 0
+    assert acceleration > velocity
+
+
+def test_residual_temporal_losses_ignore_invalid_tail():
+    reference = torch.zeros(1, 6, 2)
+    predicted = reference.clone()
+    predicted[:, 3] = 10.0
+    predicted[:, 4] = -10.0
+    predicted[:, 5] = 10.0
+    valid = torch.tensor([[True, True, True, False, False, False]])
+
+    velocity, acceleration = residual_temporal_losses(
+        predicted, reference, valid
+    )
+
+    torch.testing.assert_close(velocity, torch.zeros_like(velocity))
+    torch.testing.assert_close(acceleration, torch.zeros_like(acceleration))
+
+
+def test_learner_rejects_negative_residual_smoothness_weights():
+    with pytest.raises(ValueError, match="residual_velocity_weight"):
+        InProcessLearnerConfig.from_mapping({"residual_velocity_weight": -0.1})

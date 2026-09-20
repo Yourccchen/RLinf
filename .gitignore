@@ -24,3 +24,4 @@ PKG-INFO
 .claude/settings.json
 checkpoints/*
 results/*
+bfjm_0916/*
