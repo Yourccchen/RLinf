@@ -23,6 +23,7 @@ from rlinf.data.schema.embodied_types import Trajectory
 from rlinf.envs.remote_songling import SonglingActionCodec
 from rlinf.models import get_model
 from rlinf.serving.sseval_contract import (
+    ACTION_DIM,
     DualActionCandidates,
     TransitionFeedback,
     songling_chunk_shape,
@@ -169,9 +170,9 @@ def align_feature_model_from_sft_config(
     ``stage1_sft_config`` points at a Stage1 Hydra experiment. ``actor.model``
     supplies VLA/RLT shape, OpenPI transforms, and default ``openpi_data``.
     Eval-side ``feature_model.openpi_data`` keys override the SFT copy so
-    ``norm_stats_path`` can differ from the training host. The same Stage1
-    ``num_action_chunks`` is copied onto ``actor_model`` execute and reference
-    horizons. The deploy YAML keeps ``feature_model.model_path``,
+    ``norm_stats_path`` can differ from the training host. The deploy YAML
+    keeps the shorter ``actor_model.num_action_chunks`` execute and replay
+    reference horizons, along with ``feature_model.model_path``,
     ``feature_model.precision``, and ``openpi.task=eval``.
     """
     sft_ref = OmegaConf.select(cfg, "stage1_sft_config", default=None)
@@ -210,10 +211,23 @@ def align_feature_model_from_sft_config(
                 feature.openpi_data = merged
         actor = OmegaConf.select(cfg, "actor_model", default=None)
         if actor is not None:
-            chunks = int(src.num_action_chunks)
+            execute_chunks = int(
+                OmegaConf.select(
+                    actor,
+                    "num_action_chunks",
+                    default=int(src.num_action_chunks),
+                )
+            )
+            reference_chunks = int(
+                OmegaConf.select(
+                    actor,
+                    "ref_num_action_chunks",
+                    default=execute_chunks,
+                )
+            )
             with open_dict(actor):
-                actor.num_action_chunks = chunks
-                actor.ref_num_action_chunks = chunks
+                actor.num_action_chunks = execute_chunks
+                actor.ref_num_action_chunks = reference_chunks
 
 
 _REPLAY_ID_UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -484,20 +498,23 @@ class SsEvalRLTRuntime:
                 actor_version=self._active_actor_version,
                 reference_seed=seed,
             )
-            expected = songling_chunk_shape(self.chunk_len)
+            actor_expected = songling_chunk_shape(self.chunk_len)
+            if candidates.actor_action.shape != actor_expected:
+                raise ValueError(
+                    f"RLT Actor candidate must be {actor_expected}, got "
+                    f"{candidates.actor_action.shape}."
+                )
             if (
-                candidates.vla_action.shape != expected
-                or candidates.actor_action.shape != expected
+                candidates.vla_action.ndim != 2
+                or candidates.vla_action.shape[1] != ACTION_DIM
+                or candidates.vla_action.shape[0] < self.chunk_len
             ):
                 raise ValueError(
-                    "RLT action candidates must both be "
-                    f"{expected}, got vla={candidates.vla_action.shape}, "
-                    f"actor={candidates.actor_action.shape}."
+                    "RLT VLA candidate must have shape (H, 14) with "
+                    f"H >= {self.chunk_len}, got {candidates.vla_action.shape}."
                 )
             feedback = (
-                TransitionFeedback.from_mapping(
-                    transition_feedback, chunk_len=self.chunk_len
-                )
+                TransitionFeedback.from_mapping(transition_feedback)
                 if transition_feedback is not None
                 else None
             )
@@ -528,6 +545,20 @@ class SsEvalRLTRuntime:
             raise ValueError(
                 "Out-of-order transition feedback: expected "
                 f"{(pending.episode_id, pending.chunk_id)}, got {feedback.key}."
+            )
+        should_record = bool(
+            (feedback.rlt_switch_flags & feedback.valid_step_mask).any()
+        )
+        if not should_record:
+            self._seen_feedback.add(feedback.key)
+            if feedback.done:
+                self._resolve_episode_buffer(feedback)
+            return True
+        if feedback.executed_actions.shape != songling_chunk_shape(self.chunk_len):
+            raise ValueError(
+                "Recorded RLT feedback must match the Actor execute horizon "
+                f"{songling_chunk_shape(self.chunk_len)}, got "
+                f"{feedback.executed_actions.shape}."
             )
         trajectory = _build_feedback_trajectory(
             pending, next_obs, feedback, self.action_codec
@@ -563,9 +594,7 @@ class SsEvalRLTRuntime:
             self._require_open()
             if self._episode_id is None or self._pending is None:
                 raise RuntimeError("No active SsEval RLT episode to end.")
-            feedback = TransitionFeedback.from_mapping(
-                final_feedback, chunk_len=self.chunk_len
-            )
+            feedback = TransitionFeedback.from_mapping(final_feedback)
             if not feedback.done:
                 raise ValueError("end_episode requires terminal or truncated feedback.")
             ingested = self._ingest_feedback(feedback, self._pending.replay_obs)

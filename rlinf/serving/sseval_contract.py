@@ -67,10 +67,15 @@ class DualActionCandidates:
                 f"vla_action must have shape (C, {ACTION_DIM}) with C>=1, "
                 f"got {vla.shape}."
             )
-        if vla.shape != actor.shape:
+        if actor.shape[0] < 1 or actor.shape[1] != ACTION_DIM:
             raise ValueError(
-                "Songling candidates must both have the same shape "
-                f"(C, {ACTION_DIM}), got vla={vla.shape}, actor={actor.shape}."
+                f"actor_action must have shape (C, {ACTION_DIM}) with C>=1, "
+                f"got {actor.shape}."
+            )
+        if vla.shape[0] < actor.shape[0]:
+            raise ValueError(
+                "VLA horizon must cover the Actor execute horizon, got "
+                f"vla={vla.shape}, actor={actor.shape}."
             )
         object.__setattr__(self, "vla_action", vla)
         object.__setattr__(self, "actor_action", actor)
@@ -91,7 +96,8 @@ class DualActionCandidates:
             "actor_version": self.actor_version,
             "feature_checkpoint_hash": self.feature_checkpoint_hash,
             "reference_seed": self.reference_seed,
-            "chunk_len": int(self.vla_action.shape[0]),
+            "chunk_len": int(self.actor_action.shape[0]),
+            "vla_chunk_len": int(self.vla_action.shape[0]),
         }
 
 

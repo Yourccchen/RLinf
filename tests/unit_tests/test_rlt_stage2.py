@@ -510,7 +510,6 @@ def test_stage1_stage2_config_validation_accepts_matching_custom_chunk_len():
             "proprio_dim": 14,
             "action_dim": 14,
             "num_action_chunks": 10,
-            "ref_num_action_chunks": 10,
         },
         {
             "action_dim": 14,
@@ -534,11 +533,78 @@ def test_stage1_stage2_config_validation_accepts_matching_custom_chunk_len():
     )
 
 
+def test_stage1_stage2_config_validation_accepts_shorter_stage2_horizon():
+    validate_rlt_stage2_configs(
+        {
+            "z_dim": 2048,
+            "proprio_dim": 14,
+            "action_dim": 14,
+            "num_action_chunks": 10,
+        },
+        {
+            "action_dim": 14,
+            "num_action_chunks": CHUNK_LEN,
+            "openpi_data": {"repo_id": "songling/all_tasks"},
+            "openpi": {
+                "task": "eval",
+                "config_name": "pi05_rlt_songling_all",
+                "use_rlt": True,
+                "rlt_embed_dim": 2048,
+                "action_horizon": CHUNK_LEN,
+                "action_chunk": CHUNK_LEN,
+                "model_action_dim": 32,
+                "num_images_in_input": 3,
+                "rlt_image_only": False,
+                "rlt_use_mask": True,
+                "rlt_prefix_seq_len": 1024,
+                "rlt_num_layers": 2,
+                "rlt_num_heads": 8,
+                "rlt_encoder_type": "append_self_attention",
+            },
+        },
+    )
+
+
+def test_stage1_stage2_config_validation_rejects_reference_over_stage1():
+    policy = {
+        "z_dim": 2048,
+        "proprio_dim": 14,
+        "action_dim": 14,
+        "num_action_chunks": CHUNK_LEN + 1,
+        "ref_num_action_chunks": CHUNK_LEN + 1,
+    }
+    feature = {
+        "action_dim": 14,
+        "num_action_chunks": CHUNK_LEN,
+        "openpi_data": {"repo_id": "songling/all_tasks"},
+        "openpi": {
+            "task": "eval",
+            "config_name": "pi05_rlt_songling_all",
+            "use_rlt": True,
+            "rlt_embed_dim": 2048,
+            "action_horizon": CHUNK_LEN,
+            "action_chunk": CHUNK_LEN,
+            "model_action_dim": 32,
+            "num_images_in_input": 3,
+            "rlt_image_only": False,
+            "rlt_use_mask": True,
+            "rlt_prefix_seq_len": 1024,
+            "rlt_num_layers": 2,
+            "rlt_num_heads": 8,
+            "rlt_encoder_type": "append_self_attention",
+        },
+    }
+
+    with pytest.raises(ValueError, match="must not exceed"):
+        validate_rlt_stage2_configs(policy, feature)
+
+
 def test_stage1_stage2_config_validation_reports_horizon_mismatch():
-    with pytest.raises(ValueError, match="reference horizon"):
+    with pytest.raises(ValueError, match="Stage2 reference horizon"):
         validate_rlt_stage2_configs(
             {
                 "z_dim": 2048,
+                "proprio_dim": 14,
                 "action_dim": 14,
                 "num_action_chunks": 10,
                 "ref_num_action_chunks": 50,
@@ -546,10 +612,20 @@ def test_stage1_stage2_config_validation_reports_horizon_mismatch():
             {
                 "action_dim": 14,
                 "num_action_chunks": 10,
+                "openpi_data": {"repo_id": "songling/all_tasks"},
                 "openpi": {
                     "task": "eval",
+                    "config_name": "pi05_rlt_songling_all",
                     "use_rlt": True,
                     "rlt_embed_dim": 2048,
+                    "model_action_dim": 32,
+                    "num_images_in_input": 3,
+                    "rlt_image_only": False,
+                    "rlt_use_mask": True,
+                    "rlt_prefix_seq_len": 1024,
+                    "rlt_num_layers": 2,
+                    "rlt_num_heads": 8,
+                    "rlt_encoder_type": "append_self_attention",
                 },
             },
         )

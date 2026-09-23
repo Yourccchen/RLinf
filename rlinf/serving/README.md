@@ -38,12 +38,14 @@ timestamped run directory. The two keys cannot be set together. Autosave writes
 an earlier ``step_N``, including the directory named by
 ``replay_checkpoint``.
 
-To change the execute chunk length later, change Stage1
-``actor.model.num_action_chunks`` (and retrain that checkpoint). Align copies
-it onto the serving VLA and actor; Policy hello reports it as
-``policy_spec.chunk_len``. SEP must validate dual-action payloads against that
-advertised length instead of a hardcoded constant, then restart Policy and
-SEP. Slave uses the received action shape.
+Stage1 keeps its trained VLA horizon ``H`` (50 in the Songling recipe).
+``actor_model.num_action_chunks`` independently sets the Stage2/replay horizon
+``C`` (10 in the paper-style recipe). Each inference sends the full ``H``-step
+VLA candidate and the ``C``-step Actor candidate. Before the critical-phase
+switch, the Slave executes a configurable VLA prefix ``K``; after the switch,
+VLA fallback, Actor, and human feedback all use ``C`` steps. Only post-switch
+``C``-step transitions enter replay. Restart Policy and start a new SEP
+session after changing these horizons.
 
 The following command starts RWI PolicyServer with the in-process RLinf adapter;
 it loads Stage1 and starts the background TD3 learner, so run it only on the GPU

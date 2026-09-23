@@ -401,9 +401,15 @@ class InProcessRLTTD3Learner:
             action_dim = predicted.shape[-1] // chunk_len
             predicted_chunk = predicted.reshape(-1, chunk_len, action_dim)
             executed_chunk = batch["actions"].reshape_as(predicted_chunk)
-            ref_chunk = batch["curr_obs"]["ref_chunk"].reshape(
-                -1, chunk_len, action_dim
+            full_ref_chunk = batch["curr_obs"]["ref_chunk"].reshape(
+                predicted_chunk.shape[0], -1, action_dim
             )
+            if full_ref_chunk.shape[1] < chunk_len:
+                raise ValueError(
+                    "Reference chunk is shorter than the Actor execute horizon: "
+                    f"reference={full_ref_chunk.shape[1]}, execute={chunk_len}."
+                )
+            ref_chunk = full_ref_chunk[:, :chunk_len]
             intervene = batch["intervene_flags"].reshape(-1, chunk_len).bool()
             target = torch.where(intervene[..., None], executed_chunk, ref_chunk)
             bc_error = (predicted_chunk - target).square().mean(dim=-1)

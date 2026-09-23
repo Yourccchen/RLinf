@@ -7,9 +7,9 @@
 # forced to eval. Eval hosts do not share the Stage1 SFT assets path, so
 # feature_model.openpi_data.norm_stats_path is set here rather than copied
 # from training.
-# Execute/reference C is copied from Stage1 actor.model.num_action_chunks
-# onto feature_model and actor_model at load time. The numbers below are
-# only a fallback if stage1_sft_config is unset.
+# Stage1 keeps H=50 and sends the full VLA candidate. Before the critical
+# switch the Slave may execute a longer VLA prefix K; after the switch Stage2
+# reads/stores the first C actions, predicts C actions, and executes C steps.
 
 stage1_sft_config: examples/sft/config/songling_bfjm_rlt_stage1_sft_openpi_pi05.yaml
 
@@ -25,13 +25,14 @@ actor_checkpoint: null
 replay_checkpoint: null
 # replay_checkpoint: null
 # Every N TD3 critic updates. 0 disables auto-save. Each save copies the whole
-# replay, so a small value multiplies disk use. 50 is about 25 new chunks at
-# UTD 2, roughly 3 episodes when an episode keeps ~7 key-phase chunks.
+# replay, so a small value multiplies disk use. 50 is about 25 new C=10
+# transitions at UTD 2.
 save_interval: 50
 # Relative paths resolve against the RLinf repo root, not the RWI cwd.
 # Each Policy start writes save_dir/<YYYYMMDD_HHMMSS>/step_N and does not
-# overwrite an older run's step_N, including replay_checkpoint.
-save_dir: results/songling_rlt_sseval_td3_keychunk/checkpoints
+# overwrite an older run's step_N, including replay_checkpoint. The execute
+# horizon is embedded automatically, e.g. c10 or c50.
+save_dir: results/songling_rlt_sseval_td3_keychunk_c${actor_model.num_action_chunks}/checkpoints
 
 action_codec:
   action_low: [-2.617994, 0.0, -2.967060, -1.745330, -1.221730, -2.094396, 0.0, -2.617994, 0.0, -2.967060, -1.745330, -1.221730, -2.094396, 0.0]
@@ -51,12 +52,11 @@ actor_model:
   z_dim: 2048
   proprio_dim: 14
   action_dim: 14
-  num_action_chunks: 50
-  ref_num_action_chunks: 50
+  num_action_chunks: 10
   add_value_head: false
   add_q_head: true
   q_head_type: default
-  mlp_hidden_dim: 1024
+  mlp_hidden_dim: 256
   mlp_num_hidden_layers: 2
   # Residual actor: execute clamp(VLA_ref + mlp). Last layer starts at 0 so
   # an untrained policy copies the VLA chunk. Do not load a previous
@@ -67,7 +67,8 @@ actor_model:
   is_lora: false
 
 learner:
-  # One sample is a C=50 chunk (~5x a C=10 transition in env steps).
+  # One sample stores a C-step reference, action, reward, and validity sequence.
+  # Stage1 generates H=50 online, but only its first C actions enter replay.
   # Sampling is with replacement and clamps to the replay size, so this may
   # exceed min_buffer_size while the buffer is still small.
   batch_size: 64

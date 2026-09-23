@@ -83,6 +83,7 @@ def _observation(value=0.0):
 def _feedback(
     chunk_id=0,
     *,
+    chunk_len=CHUNK_LEN,
     done=False,
     truncated=False,
     mode="actor",
@@ -90,9 +91,9 @@ def _feedback(
     episode_id="episode-1",
     critical_phase=True,
 ):
-    rewards = np.zeros(CHUNK_LEN, dtype=np.float32)
-    terminated = np.zeros(CHUNK_LEN, dtype=bool)
-    trunc = np.zeros(CHUNK_LEN, dtype=bool)
+    rewards = np.zeros(chunk_len, dtype=np.float32)
+    terminated = np.zeros(chunk_len, dtype=bool)
+    trunc = np.zeros(chunk_len, dtype=bool)
     if done:
         terminated[-1] = True
         rewards[-1] = float(reward)
@@ -103,13 +104,13 @@ def _feedback(
         "episode_id": episode_id,
         "chunk_id": chunk_id,
         "selected_mode": mode,
-        "executed_actions": np.full((CHUNK_LEN, ACTION_DIM), 0.5, dtype=np.float32),
-        "valid_step_mask": np.ones(CHUNK_LEN, dtype=bool),
+        "executed_actions": np.full((chunk_len, ACTION_DIM), 0.5, dtype=np.float32),
+        "valid_step_mask": np.ones(chunk_len, dtype=bool),
         "rewards": rewards,
         "terminated": terminated,
         "truncated": trunc,
-        "intervene_flags": np.full(CHUNK_LEN, mode == "human", dtype=bool),
-        "rlt_switch_flags": np.full(CHUNK_LEN, critical_phase, dtype=bool),
+        "intervene_flags": np.full(chunk_len, mode == "human", dtype=bool),
+        "rlt_switch_flags": np.full(chunk_len, critical_phase, dtype=bool),
         "actor_version": 0,
         "timestamps": {},
     }
@@ -262,6 +263,71 @@ def test_runtime_emits_candidates_and_holds_feedback_until_outcome():
     assert not trajectory.terminations.any()
     assert learner.submitted[1].terminations.any()
     assert learner.submitted[1].rewards.reshape(-1)[-1] == 1.0
+
+
+def test_runtime_executes_ten_steps_from_fifty_step_stage1_chunk():
+    policy = RLTTD3MLPPolicy(
+        z_dim=8,
+        proprio_dim=14,
+        action_dim=14,
+        num_action_chunks=10,
+    )
+    learner = FakeLearner()
+    runtime = SsEvalRLTRuntime(
+        feature_model=FakeFeatureModel(),
+        active_policy_model=policy,
+        action_codec=SonglingActionCodec([-1.0] * 14, [1.0] * 14),
+        learner=learner,
+    )
+    runtime.start_episode("episode-1", "fold clothes")
+
+    candidates = runtime.infer_candidates(_observation())
+
+    assert candidates.vla_action.shape == (CHUNK_LEN, ACTION_DIM)
+    assert candidates.actor_action.shape == (10, ACTION_DIM)
+    assert runtime._pending is not None
+    assert runtime._pending.replay_obs["ref_chunk"].shape == (1, 10, ACTION_DIM)
+
+
+def test_runtime_switches_from_unrecorded_vla50_to_recorded_actor10():
+    policy = RLTTD3MLPPolicy(
+        z_dim=8,
+        proprio_dim=14,
+        action_dim=14,
+        num_action_chunks=10,
+    )
+    learner = FakeLearner()
+    runtime = SsEvalRLTRuntime(
+        feature_model=FakeFeatureModel(),
+        active_policy_model=policy,
+        action_codec=SonglingActionCodec([-1.0] * 14, [1.0] * 14),
+        learner=learner,
+    )
+    runtime.start_episode("episode-1", "fold clothes")
+    runtime.infer_candidates(_observation(0.0))
+
+    runtime.infer_candidates(
+        _observation(1.0),
+        _feedback(0, mode="vla", critical_phase=False),
+    )
+
+    assert runtime._episode_buffer == []
+    assert learner.submitted == []
+    runtime.end_episode(
+        _feedback(
+            1,
+            chunk_len=10,
+            mode="actor",
+            critical_phase=True,
+            done=True,
+            reward=1.0,
+        )
+    )
+
+    assert len(learner.submitted) == 1
+    trajectory = learner.submitted[0]
+    assert trajectory.actions.shape[-1] == 10 * ACTION_DIM
+    assert trajectory.curr_obs["ref_chunk"].shape[-2:] == (10, ACTION_DIM)
 
 
 def test_runtime_records_only_chunks_after_critical_phase_starts():
@@ -890,8 +956,8 @@ def test_align_copies_stage1_fields_from_sft_yaml(tmp_path):
                 "  precision: bf16",
                 "  num_action_chunks: 99",
                 "actor_model:",
-                "  num_action_chunks: 99",
-                "  ref_num_action_chunks: 99",
+                "  num_action_chunks: 5",
+                "  ref_num_action_chunks: 5",
             ]
         )
         + "\n",
@@ -904,8 +970,8 @@ def test_align_copies_stage1_fields_from_sft_yaml(tmp_path):
     assert cfg.feature_model.precision == "bf16"
     assert cfg.feature_model.num_action_chunks == 10
     assert cfg.feature_model.action_dim == 14
-    assert cfg.actor_model.num_action_chunks == 10
-    assert cfg.actor_model.ref_num_action_chunks == 10
+    assert cfg.actor_model.num_action_chunks == 5
+    assert cfg.actor_model.ref_num_action_chunks == 5
     assert cfg.feature_model.num_steps == 5
     assert cfg.feature_model.openpi.task == "eval"
     assert cfg.feature_model.openpi.config_name == "pi05_rlt_songling_joint"
@@ -992,18 +1058,18 @@ def test_align_checked_in_songling_sft_config():
     assert cfg.feature_model.num_action_chunks == 50
     assert cfg.feature_model.openpi.action_horizon == 50
     assert cfg.feature_model.openpi.action_chunk == 50
-    assert cfg.actor_model.num_action_chunks == 50
-    assert cfg.actor_model.ref_num_action_chunks == 50
+    assert cfg.actor_model.num_action_chunks == 10
+    assert cfg.actor_model.ref_num_action_chunks == 10
     raw_feature = OmegaConf.to_container(cfg.feature_model, resolve=False)
     raw_actor = OmegaConf.to_container(cfg.actor_model, resolve=False)
     validate_rlt_stage2_configs(raw_actor, raw_feature)
     assert raw_feature["model_path"] == (
         "/home/fanyiming/RLinf/checkpoints/"
-        "songling_bfjm_rlt_stage1_sft_openpi_pi05/global_step_10000/actor"
+        "songling_bfjm_rlt_stage1_sft_openpi_pi05/global_step_40000/actor"
     )
     assert raw_feature["openpi_data"]["norm_stats_path"] == (
         "/home/fanyiming/RLinf/checkpoints/"
-        "songling_bfjm_rlt_stage1_sft_openpi_pi05/global_step_10000/norm_stats.json"
+        "songling_bfjm_rlt_stage1_sft_openpi_pi05/norm_stats.json"
     )
     assert cfg.feature_model.precision == "bf16"
 

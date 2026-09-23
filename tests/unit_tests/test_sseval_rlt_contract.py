@@ -47,6 +47,7 @@ def test_dual_candidates_emit_backward_compatible_kwargs():
     assert kwargs["chunk_id"] == 0
     assert kwargs["actor_action"].shape == (CHUNK_LEN, ACTION_DIM)
     assert kwargs["chunk_len"] == CHUNK_LEN
+    assert kwargs["vla_chunk_len"] == CHUNK_LEN
 
 
 def test_candidates_accept_any_matching_chunk_len():
@@ -62,6 +63,24 @@ def test_candidates_accept_any_matching_chunk_len():
     )
     assert candidates.vla_action.shape == (10, ACTION_DIM)
     assert candidates.to_action_kwargs()["chunk_len"] == 10
+
+
+def test_candidates_accept_longer_vla_horizon():
+    candidates = DualActionCandidates(
+        episode_id="episode-1",
+        chunk_id=0,
+        vla_action=np.zeros((CHUNK_LEN, ACTION_DIM)),
+        actor_action=np.ones((10, ACTION_DIM)),
+        actor_ready=True,
+        actor_version=1,
+        feature_checkpoint_hash=0,
+        reference_seed=0,
+    )
+    kwargs = candidates.to_action_kwargs()
+    assert candidates.vla_action.shape == (CHUNK_LEN, ACTION_DIM)
+    assert candidates.actor_action.shape == (10, ACTION_DIM)
+    assert kwargs["vla_chunk_len"] == CHUNK_LEN
+    assert kwargs["chunk_len"] == 10
 
 
 def test_feedback_accepts_matching_custom_chunk_len():
@@ -110,7 +129,7 @@ def test_feedback_rejects_human_actions_without_intervention_flags():
 
 
 def test_candidate_shape_is_strict():
-    with pytest.raises(ValueError, match="shape"):
+    with pytest.raises(ValueError, match="horizon"):
         DualActionCandidates(
             episode_id="episode-1",
             chunk_id=0,

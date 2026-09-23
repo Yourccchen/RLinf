@@ -62,17 +62,6 @@ def validate_rlt_stage2_configs(policy_cfg: Any, feature_cfg: Any) -> None:
             int(_cfg_get(feature_cfg, "action_dim")),
         ),
         (
-            "reference horizon",
-            int(
-                _cfg_get(
-                    policy_cfg,
-                    "ref_num_action_chunks",
-                    _cfg_get(policy_cfg, "num_action_chunks"),
-                )
-            ),
-            int(_cfg_get(feature_cfg, "num_action_chunks")),
-        ),
-        (
             "RLT embedding dim",
             int(_cfg_get(policy_cfg, "z_dim")),
             int(_cfg_get(feature_openpi, "rlt_embed_dim", 2048)),
@@ -89,11 +78,15 @@ def validate_rlt_stage2_configs(policy_cfg: Any, feature_cfg: Any) -> None:
         )
     config_name = str(_cfg_get(feature_openpi, "config_name", "")).lower()
     if "songling" in config_name:
-        horizon = int(_cfg_get(policy_cfg, "num_action_chunks"))
-        if horizon < 1:
+        execute_horizon = int(_cfg_get(policy_cfg, "num_action_chunks"))
+        reference_horizon = int(
+            _cfg_get(policy_cfg, "ref_num_action_chunks", execute_horizon)
+        )
+        stage1_horizon = int(_cfg_get(feature_cfg, "num_action_chunks"))
+        if execute_horizon < 1:
             raise ValueError(
                 f"Invalid Songling RLT configuration: Stage2 chunk length "
-                f"must be positive, got {horizon}."
+                f"must be positive, got {execute_horizon}."
             )
         songling_checks = (
             ("Stage2 action_dim", int(_cfg_get(policy_cfg, "action_dim")), ACTION_DIM),
@@ -104,23 +97,18 @@ def validate_rlt_stage2_configs(policy_cfg: Any, feature_cfg: Any) -> None:
             ),
             (
                 "Stage2 reference horizon",
-                int(_cfg_get(policy_cfg, "ref_num_action_chunks")),
-                horizon,
-            ),
-            (
-                "Stage1 reference horizon",
-                int(_cfg_get(feature_cfg, "num_action_chunks")),
-                horizon,
+                reference_horizon,
+                execute_horizon,
             ),
             (
                 "Stage1 openpi action_horizon",
-                int(_cfg_get(feature_openpi, "action_horizon", horizon)),
-                horizon,
+                int(_cfg_get(feature_openpi, "action_horizon", stage1_horizon)),
+                stage1_horizon,
             ),
             (
                 "Stage1 openpi action_chunk",
-                int(_cfg_get(feature_openpi, "action_chunk", horizon)),
-                horizon,
+                int(_cfg_get(feature_openpi, "action_chunk", stage1_horizon)),
+                stage1_horizon,
             ),
             (
                 "Stage1 model_action_dim",
@@ -168,6 +156,11 @@ def validate_rlt_stage2_configs(policy_cfg: Any, feature_cfg: Any) -> None:
             for name, actual, expected in songling_checks
             if actual != expected
         ]
+        if reference_horizon > stage1_horizon:
+            invalid.append(
+                "Stage2 reference horizon must not exceed Stage1 horizon: "
+                f"reference={reference_horizon}, Stage1={stage1_horizon}"
+            )
         expected_repos = {
             "pi05_rlt_songling_all": "songling/all_tasks",
             "pi05_rlt_songling_joint": "songling/garment_folding",
@@ -222,8 +215,20 @@ def predict_rlt_candidates(
     rng.manual_seed(int(reference_seed))
     extracted = feature_model.extract_rlt_obs(env_obs, rng=rng)
     vla_action = extracted["ref_chunk"]
+    execute_horizon = int(getattr(policy_model, "chunk_len"))
+    reference_horizon = int(
+        getattr(policy_model, "ref_chunk_len", execute_horizon)
+    )
+    if vla_action.shape[-2] < reference_horizon:
+        raise ValueError(
+            "Stage1 reference chunk is shorter than the Stage2 reference horizon: "
+            f"Stage1={vla_action.shape[-2]}, Stage2={reference_horizon}."
+        )
     normalized_obs = dict(extracted)
-    normalized_obs["ref_chunk"] = action_codec.encode(vla_action, clip=True)
+    normalized_obs["ref_chunk"] = action_codec.encode(
+        vla_action[..., :reference_horizon, :],
+        clip=True,
+    )
     actor_action, _ = policy_model.predict_action_batch(
         env_obs=normalized_obs, mode="eval", return_obs=True
     )
