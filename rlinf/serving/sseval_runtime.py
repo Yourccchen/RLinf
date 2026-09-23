@@ -293,6 +293,9 @@ def _build_feedback_trajectory(
     truncated = torch.from_numpy(feedback.truncated).bool()
     valid = torch.from_numpy(feedback.valid_step_mask).bool()
     intervene = torch.from_numpy(feedback.intervene_flags).bool()
+    record_transition = bool(
+        (feedback.rlt_switch_flags & feedback.valid_step_mask).any()
+    )
     curr = _unbatch_replay_obs(pending.replay_obs)
     curr["ref_chunk"] = overwrite_rlt_ref_with_human(
         curr["ref_chunk"].unsqueeze(0),
@@ -317,7 +320,9 @@ def _build_feedback_trajectory(
         forward_inputs={
             "action": normalized_actions.reshape(1, 1, -1),
             "valid_step_mask": valid.reshape(1, 1, -1),
-            "record_transition": torch.ones((1, 1, 1), dtype=torch.bool),
+            "record_transition": torch.full(
+                (1, 1, 1), record_transition, dtype=torch.bool
+            ),
             "actor_switch": torch.full(
                 (1, 1, 1),
                 feedback.selected_mode.value == "actor",
@@ -527,7 +532,13 @@ class SsEvalRLTRuntime:
         trajectory = _build_feedback_trajectory(
             pending, next_obs, feedback, self.action_codec
         )
-        self._episode_buffer.append(trajectory)
+        if bool(
+            trajectory.forward_inputs["record_transition"]
+            .detach()
+            .to(torch.bool)
+            .all()
+        ):
+            self._episode_buffer.append(trajectory)
         self._seen_feedback.add(feedback.key)
         if feedback.done:
             self._resolve_episode_buffer(feedback)

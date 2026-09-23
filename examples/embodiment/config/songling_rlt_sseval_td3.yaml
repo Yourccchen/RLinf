@@ -22,25 +22,27 @@ actor_checkpoint: null
 # directory loads replay/ only, then runs (n - min_buffer_size + 1) * utd
 # critic updates and writes save_interval checkpoints under this run's
 # timestamp folder. Null skips restore.
-replay_checkpoint: results/songling_rlt_sseval_td3/checkpoints/step_1700
-# Every N TD3 critic updates. 0 disables auto-save. 500 is about 100 new
-# C=50 chunks at UTD 5, roughly 10 episodes if each episode has ~10 chunks.
-save_interval: 500
+replay_checkpoint: null
+# replay_checkpoint: null
+# Every N TD3 critic updates. 0 disables auto-save. Each save copies the whole
+# replay, so a small value multiplies disk use. 50 is about 25 new chunks at
+# UTD 2, roughly 3 episodes when an episode keeps ~7 key-phase chunks.
+save_interval: 50
 # Relative paths resolve against the RLinf repo root, not the RWI cwd.
 # Each Policy start writes save_dir/<YYYYMMDD_HHMMSS>/step_N and does not
 # overwrite an older run's step_N, including replay_checkpoint.
-save_dir: results/songling_rlt_sseval_td3/checkpoints
+save_dir: results/songling_rlt_sseval_td3_keychunk/checkpoints
 
 action_codec:
-  action_low: ${oc.env:SONGLING_ACTION_LOW}
-  action_high: ${oc.env:SONGLING_ACTION_HIGH}
+  action_low: [-2.617994, 0.0, -2.967060, -1.745330, -1.221730, -2.094396, 0.0, -2.617994, 0.0, -2.967060, -1.745330, -1.221730, -2.094396, 0.0]
+  action_high: [2.617994, 3.141593, 0.0, 1.745330, 1.221730, 2.094396, 100.0, 2.617994, 3.141593, 0.0, 1.745330, 1.221730, 2.094396, 100.0]
 
 feature_model:
-  model_path: /home/fanyiming/RLinf/checkpoints/songling_bfjm_rlt_stage1_sft_openpi_pi05/global_step_10000/actor
+  model_path: /home/fanyiming/RLinf/checkpoints/songling_bfjm_rlt_stage1_sft_openpi_pi05/global_step_40000/actor
   precision: bf16
   is_lora: false
   openpi_data:
-    norm_stats_path: /home/fanyiming/RLinf/checkpoints/songling_bfjm_rlt_stage1_sft_openpi_pi05/global_step_10000/norm_stats.json
+    norm_stats_path: /home/fanyiming/RLinf/checkpoints/songling_bfjm_rlt_stage1_sft_openpi_pi05/norm_stats.json
 
 actor_model:
   model_type: rlt_td3_mlp_policy
@@ -66,10 +68,15 @@ actor_model:
 
 learner:
   # One sample is a C=50 chunk (~5x a C=10 transition in env steps).
+  # Sampling is with replacement and clamps to the replay size, so this may
+  # exceed min_buffer_size while the buffer is still small.
   batch_size: 64
-  min_buffer_size: 200
+  min_buffer_size: 10
   replay_capacity: 50000
-  utd: 5
+  # Held-out episodes stop improving after ~500 BC updates on this dataset, so
+  # 5 updates per new chunk only bought memorization. Raise it again once the
+  # replay is several times larger.
+  utd: 2
   gamma: 0.99
   tau: 0.005
   actor_update_interval: 2
@@ -83,11 +90,14 @@ learner:
   # Penalize high-frequency residual corrections while preserving the VLA profile.
   residual_velocity_weight: 50
   residual_acceleration_weight: 20
-  warmup_updates: 1000
-  warmup_bc_weight: 7.0
+  warmup_updates: 50
+  warmup_bc_weight: 5.0
   warmup_q_weight: 0.05
   online_bc_weight: 2.8
-  online_q_weight: 0.5
-  ramp_updates: 5000
+  online_q_weight: 0.45
+  ramp_updates: 20
   queue_size: 1024
   seed: 1234
+  # Training metrics line every N critic updates. residual_abs_mean near 0
+  # means the actor is still copying the VLA chunk.
+  log_interval: 100

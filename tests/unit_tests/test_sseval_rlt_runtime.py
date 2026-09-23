@@ -88,6 +88,7 @@ def _feedback(
     mode="actor",
     reward=0.0,
     episode_id="episode-1",
+    critical_phase=True,
 ):
     rewards = np.zeros(CHUNK_LEN, dtype=np.float32)
     terminated = np.zeros(CHUNK_LEN, dtype=bool)
@@ -108,7 +109,7 @@ def _feedback(
         "terminated": terminated,
         "truncated": trunc,
         "intervene_flags": np.full(CHUNK_LEN, mode == "human", dtype=bool),
-        "rlt_switch_flags": np.ones(CHUNK_LEN, dtype=bool),
+        "rlt_switch_flags": np.full(CHUNK_LEN, critical_phase, dtype=bool),
         "actor_version": 0,
         "timestamps": {},
     }
@@ -263,6 +264,37 @@ def test_runtime_emits_candidates_and_holds_feedback_until_outcome():
     assert learner.submitted[1].rewards.reshape(-1)[-1] == 1.0
 
 
+def test_runtime_records_only_chunks_after_critical_phase_starts():
+    runtime, learner = _runtime()
+    runtime.start_episode("episode-1", "fold clothes")
+    runtime.infer_candidates(_observation(0.0))
+    runtime.infer_candidates(
+        _observation(1.0),
+        _feedback(0, critical_phase=False),
+    )
+    runtime.end_episode(
+        _feedback(1, done=True, reward=1.0, critical_phase=True)
+    )
+
+    assert len(learner.submitted) == 1
+    assert learner.submitted[0].model_weights_id == (
+        "ep-episode-1_chunk-1_actor"
+    )
+    assert learner.submitted[0].forward_inputs["record_transition"].all()
+    assert learner.submitted[0].terminations.any()
+
+
+def test_runtime_drops_labeled_episode_when_critical_phase_never_starts():
+    runtime, learner = _runtime()
+    runtime.start_episode("episode-1", "fold clothes")
+    runtime.infer_candidates(_observation(0.0))
+    runtime.end_episode(
+        _feedback(0, done=True, reward=1.0, critical_phase=False)
+    )
+
+    assert learner.submitted == []
+
+
 def test_runtime_rejects_out_of_order_feedback():
     runtime, _ = _runtime()
     runtime.start_episode("episode-1", "fold clothes")
@@ -342,6 +374,64 @@ def test_in_process_learner_runs_utd_and_delays_actor_update():
     assert learner.last_metrics["residual_smoothness_loss"] >= 0.0
     assert learner.take_candidate() is not None
     learner.close()
+
+
+def _metrics_learner(**overrides):
+    model = RLTTD3MLPPolicy(
+        z_dim=8,
+        proprio_dim=14,
+        action_dim=14,
+        num_action_chunks=10,
+        actor_noise_sigma=0.0,
+    )
+    settings = dict(
+        batch_size=2,
+        min_buffer_size=1,
+        replay_capacity=8,
+        utd=1,
+        actor_update_interval=2,
+        warmup_updates=2,
+    )
+    settings.update(overrides)
+    return InProcessRLTTD3Learner(
+        model, InProcessLearnerConfig(**settings), start_background=False
+    )
+
+
+def test_learner_metrics_expose_actor_objective_terms():
+    learner = _metrics_learner(log_interval=1)
+    learner.replay.add_trajectories([_offline_rlt_trajectory()])
+
+    learner.train_once()
+    critic_only = learner.last_metrics
+    learner.train_once()
+    with_actor = learner.last_metrics
+
+    assert critic_only["actor_updated"] == 0.0
+    assert with_actor["actor_updated"] == 1.0
+    assert with_actor["bc_weight"] == 7.0
+    for key in ("bc_loss", "q_pi", "residual_abs_mean", "target_q"):
+        assert with_actor[key] == with_actor[key]
+    learner.close()
+
+
+def test_learner_trains_when_replay_is_smaller_than_batch_size():
+    learner = _metrics_learner(batch_size=64, min_buffer_size=2, utd=1)
+    for index in range(2):
+        learner.replay.add_trajectories(
+            [_offline_rlt_trajectory(model_weights_id=f"t{index}")]
+        )
+
+    metrics = learner.train_once()
+
+    assert metrics["update_step"] == 1.0
+    assert metrics["replay_size"] == 2.0
+    learner.close()
+
+
+def test_learner_rejects_negative_log_interval():
+    with pytest.raises(ValueError, match="log_interval"):
+        InProcessLearnerConfig.from_mapping({"log_interval": -1})
 
 
 def test_terminal_feedback_closes_runtime_episode():

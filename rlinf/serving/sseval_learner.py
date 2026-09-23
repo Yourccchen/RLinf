@@ -23,6 +23,17 @@ from rlinf.utils.logging import get_logger
 
 logger = get_logger()
 
+# Reported on every log line even when the step skipped the delayed actor update.
+_ACTOR_METRIC_KEYS = (
+    "actor_loss",
+    "bc_loss",
+    "q_pi",
+    "bc_weight",
+    "q_weight",
+    "residual_abs_mean",
+    "residual_smoothness_loss",
+)
+
 
 def make_sseval_run_save_dir(save_dir: str | Path, *, stamp: str | None = None) -> Path:
     """Create a unique timestamped run directory under ``save_dir``.
@@ -83,6 +94,8 @@ class InProcessLearnerConfig:
     ramp_updates: int = 20000
     queue_size: int = 1024
     seed: int = 1234
+    # Every N critic updates, emit one training metrics line. 0 disables it.
+    log_interval: int = 100
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any] | None):
@@ -108,6 +121,8 @@ class InProcessLearnerConfig:
         ):
             if float(getattr(result, name)) < 0:
                 raise ValueError(f"{name} must be non-negative.")
+        if int(result.log_interval) < 0:
+            raise ValueError("log_interval must be non-negative.")
         return result
 
 
@@ -218,6 +233,7 @@ class InProcessRLTTD3Learner:
         self._candidate_actor_state: dict[str, torch.Tensor] | None = None
         self._candidate_version: int | None = None
         self._last_metrics: dict[str, float] = {}
+        self._last_actor_metrics: dict[str, float] = {}
         self._closed = False
         self._thread: threading.Thread | None = None
         if start_background:
@@ -307,7 +323,10 @@ class InProcessRLTTD3Learner:
             batch["actions"],
             batch.get("intervene_flags"),
         )
-        rewards = batch["rewards"].reshape(self.config.batch_size, -1).float()
+        # Sampling clamps to the replay size, so this can be below batch_size
+        # while the buffer is still filling up.
+        sampled_batch_size = int(batch["rewards"].shape[0])
+        rewards = batch["rewards"].reshape(sampled_batch_size, -1).float()
         valid = batch["forward_inputs"]["valid_step_mask"].reshape_as(rewards).bool()
         steps = torch.arange(rewards.shape[-1], device=self.device, dtype=rewards.dtype)
         discounts = torch.pow(
@@ -355,6 +374,11 @@ class InProcessRLTTD3Learner:
         self.critic_optimizer.step()
 
         actor_loss_value = float("nan")
+        bc_loss_value = float("nan")
+        q_pi_value = float("nan")
+        bc_weight_value = float("nan")
+        q_weight_value = float("nan")
+        residual_abs_value = float("nan")
         residual_velocity_value = float("nan")
         residual_acceleration_value = float("nan")
         residual_smoothness_value = float("nan")
@@ -415,6 +439,15 @@ class InProcessRLTTD3Learner:
             )
             self.actor_optimizer.step()
             actor_loss_value = float(actor_loss.detach().cpu())
+            bc_loss_value = float(bc_loss.detach().cpu())
+            q_pi_value = float(q1.mean().detach().cpu())
+            bc_weight_value = float(bc_weight)
+            q_weight_value = float(q_weight)
+            # How far the deployed chunk departs from the VLA reference. Stays
+            # near zero while the residual actor is still copying Stage1.
+            residual_abs_value = float(
+                (smooth_chunk - ref_chunk).abs().mean().detach().cpu()
+            )
             residual_velocity_value = float(
                 residual_velocity_loss.detach().cpu()
             )
@@ -433,8 +466,14 @@ class InProcessRLTTD3Learner:
         self._last_metrics = {
             "critic_loss": float(critic_loss.detach().cpu()),
             "critic_grad_norm": float(critic_norm.detach().cpu()),
+            "target_q": float(target_q.mean().detach().cpu()),
             "actor_loss": actor_loss_value,
             "actor_grad_norm": float(actor_norm.detach().cpu()),
+            "bc_loss": bc_loss_value,
+            "q_pi": q_pi_value,
+            "bc_weight": bc_weight_value,
+            "q_weight": q_weight_value,
+            "residual_abs_mean": residual_abs_value,
             "residual_velocity_loss": residual_velocity_value,
             "residual_acceleration_loss": residual_acceleration_value,
             "residual_smoothness_loss": residual_smoothness_value,
@@ -442,7 +481,37 @@ class InProcessRLTTD3Learner:
             "update_step": float(self.update_step),
             "replay_size": float(self.replay.total_samples),
         }
+        if actor_updated:
+            self._last_actor_metrics = {
+                key: self._last_metrics[key] for key in _ACTOR_METRIC_KEYS
+            }
+        self._maybe_log_metrics()
         return dict(self._last_metrics)
+
+    def _maybe_log_metrics(self) -> None:
+        interval = int(self.config.log_interval)
+        if interval <= 0 or self.update_step % interval != 0:
+            return
+        # The actor only updates every ``actor_update_interval`` steps, so reuse
+        # the most recent actor values instead of logging NaN.
+        metrics = {**self._last_metrics, **self._last_actor_metrics}
+        logger.info(
+            "SsEval TD3 step=%d replay=%d actor_ready=%s | critic_loss=%.4f "
+            "target_q=%.4f | actor_loss=%.4f bc=%.5f q_pi=%.4f "
+            "(bc_w=%.2f q_w=%.3f) | residual_abs=%.5f smooth=%.5f",
+            int(metrics["update_step"]),
+            int(metrics["replay_size"]),
+            self.actor_ready,
+            metrics["critic_loss"],
+            metrics["target_q"],
+            metrics["actor_loss"],
+            metrics["bc_loss"],
+            metrics["q_pi"],
+            metrics["bc_weight"],
+            metrics["q_weight"],
+            metrics["residual_abs_mean"],
+            metrics["residual_smoothness_loss"],
+        )
 
     @torch.no_grad()
     def _soft_update_target_critics(self) -> None:
