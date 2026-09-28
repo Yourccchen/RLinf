@@ -208,6 +208,7 @@ def predict_rlt_candidates(
     actor_ready: bool,
     actor_version: int,
     reference_seed: int,
+    actor_mode: Literal["train", "eval"] = "eval",
 ) -> tuple[DualActionCandidates, dict[str, torch.Tensor]]:
     """Return both physical VLA and Actor chunks without choosing execution mode."""
     device = next(feature_model.parameters()).device
@@ -216,9 +217,7 @@ def predict_rlt_candidates(
     extracted = feature_model.extract_rlt_obs(env_obs, rng=rng)
     vla_action = extracted["ref_chunk"]
     execute_horizon = int(getattr(policy_model, "chunk_len"))
-    reference_horizon = int(
-        getattr(policy_model, "ref_chunk_len", execute_horizon)
-    )
+    reference_horizon = int(getattr(policy_model, "ref_chunk_len", execute_horizon))
     if vla_action.shape[-2] < reference_horizon:
         raise ValueError(
             "Stage1 reference chunk is shorter than the Stage2 reference horizon: "
@@ -230,7 +229,7 @@ def predict_rlt_candidates(
         clip=True,
     )
     actor_action, _ = policy_model.predict_action_batch(
-        env_obs=normalized_obs, mode="eval", return_obs=True
+        env_obs=normalized_obs, mode=actor_mode, return_obs=True
     )
     if isinstance(actor_action, np.ndarray):
         actor_action = torch.from_numpy(actor_action).to(normalized_obs["z_rl"].device)

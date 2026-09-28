@@ -3,7 +3,7 @@
 #
 # Frozen Stage1 VLA/RLT shape and OpenPI transforms are copied from
 # actor.model in stage1_sft_config. This file keeps the checkpoint path,
-# eval precision, norm stats path, TD3 actor, and learner. openpi.task is
+# eval precision, norm stats path, paper-style Gaussian actor, and learner. openpi.task is
 # forced to eval. Eval hosts do not share the Stage1 SFT assets path, so
 # feature_model.openpi_data.norm_stats_path is set here rather than copied
 # from training.
@@ -15,24 +15,22 @@ stage1_sft_config: examples/sft/config/songling_bfjm_rlt_stage1_sft_openpi_pi05.
 
 device: ${oc.env:SONGLING_RLT_DEVICE,cuda}
 reference_seed: 2026
-# Null keeps a random Stage2 policy. A step_N directory restores learner.pt
-# and replay/. Mutually exclusive with replay_checkpoint.
+# Online collection samples the Gaussian Actor; set false for deterministic eval.
+actor_rollout_sampling: true
+transition_stride: 2
+# Paper-faithful runs start Actor/Critic and replay from scratch. A step_N
+# directory resumes a checkpoint created by this same model_type.
 actor_checkpoint: null
-# Reuse labeled chunks without restoring actor/critic weights. A step_N
-# directory loads replay/ only, then runs (n - min_buffer_size + 1) * utd
-# critic updates and writes save_interval checkpoints under this run's
-# timestamp folder. Null skips restore.
-replay_checkpoint: null
-# replay_checkpoint: null
+replay_checkpoint: /home/fanyiming/RLinf/results/songling_rlt_sseval_td3_keychunk_c10/checkpoints/20260923_190659/step_504
 # Every N TD3 critic updates. 0 disables auto-save. Each save copies the whole
-# replay, so a small value multiplies disk use. 50 is about 25 new C=10
-# transitions at UTD 2.
+# replay, so a small value multiplies disk use. 50 is about 10 new C=10
+# transitions at UTD 5.
 save_interval: 50
 # Relative paths resolve against the RLinf repo root, not the RWI cwd.
 # Each Policy start writes save_dir/<YYYYMMDD_HHMMSS>/step_N and does not
 # overwrite an older run's step_N, including replay_checkpoint. The execute
 # horizon is embedded automatically, e.g. c10 or c50.
-save_dir: results/songling_rlt_sseval_td3_keychunk_c${actor_model.num_action_chunks}/checkpoints
+save_dir: results/songling_rlt_sseval_paper_c${actor_model.num_action_chunks}/checkpoints
 
 action_codec:
   action_low: [-2.617994, 0.0, -2.967060, -1.745330, -1.221730, -2.094396, 0.0, -2.617994, 0.0, -2.967060, -1.745330, -1.221730, -2.094396, 0.0]
@@ -46,7 +44,7 @@ feature_model:
     norm_stats_path: /home/fanyiming/RLinf/checkpoints/songling_bfjm_rlt_stage1_sft_openpi_pi05/norm_stats.json
 
 actor_model:
-  model_type: rlt_td3_mlp_policy
+  model_type: rlt_paper_mlp_policy
   precision: fp32
   policy_setup: songling-absolute-qpos
   z_dim: 2048
@@ -58,12 +56,7 @@ actor_model:
   q_head_type: default
   mlp_hidden_dim: 256
   mlp_num_hidden_layers: 2
-  # Residual actor: execute clamp(VLA_ref + mlp). Last layer starts at 0 so
-  # an untrained policy copies the VLA chunk. Do not load a previous
-  # direct-reconstruction learner.pt; replay_checkpoint is still valid.
-  actor_residual: true
-  actor_noise_sigma: 0.1
-  ref_action_dropout: 0.5
+  fixed_std: 0.002
   is_lora: false
 
 learner:
@@ -71,13 +64,13 @@ learner:
   # Stage1 generates H=50 online, but only its first C actions enter replay.
   # Sampling is with replacement and clamps to the replay size, so this may
   # exceed min_buffer_size while the buffer is still small.
-  batch_size: 64
-  min_buffer_size: 10
+  batch_size: 256
+  min_buffer_size: 100
   replay_capacity: 50000
   # Held-out episodes stop improving after ~500 BC updates on this dataset, so
   # 5 updates per new chunk only bought memorization. Raise it again once the
   # replay is several times larger.
-  utd: 2
+  utd: 5
   gamma: 0.99
   tau: 0.005
   actor_update_interval: 2
@@ -86,19 +79,14 @@ learner:
   actor_clip_grad: 10.0
   critic_clip_grad: 10.0
   reference_dropout_prob: 0.5
+  # Actor loss = bc_regularizer_beta * BC - Q1.
+  actor_objective: bc_regularized_q
+  bc_regularizer_beta: 2.0
+  # Count executed critical-phase transitions, not gradient updates.
+  warmup_transitions: 100
   target_action_noise: true
   actor_update_action_noise: true
-  # Penalize high-frequency residual corrections while preserving the VLA profile.
-  residual_velocity_weight: 50
-  residual_acceleration_weight: 20
-  warmup_updates: 50
-  warmup_bc_weight: 5.0
-  warmup_q_weight: 0.05
-  online_bc_weight: 2.8
-  online_q_weight: 0.45
-  ramp_updates: 20
   queue_size: 1024
   seed: 1234
-  # Training metrics line every N critic updates. residual_abs_mean near 0
-  # means the actor is still copying the VLA chunk.
+  # Training metrics line every N critic updates.
   log_interval: 100

@@ -21,7 +21,7 @@ versions.
 that Stage1 SFT YAML into `feature_model` (shape, OpenPI transforms, RLT
 encoder, default `openpi_data`) and forces `openpi.task: eval`. The deploy YAML
 still owns `feature_model.model_path`, `precision`,
-`openpi_data.norm_stats_path`, the TD3 actor, and the learner. Eval hosts do
+`openpi_data.norm_stats_path`, the Stage2 actor, and the learner. Eval hosts do
 not share the Stage1 SFT assets path, so the Stage1 checkpoint and
 `norm_stats.json` paths are written in this file instead of inherited from
 training. Point `stage1_sft_config` at the YAML used for the Stage1 run so

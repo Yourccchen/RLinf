@@ -93,6 +93,9 @@ SupportedModel.OPENPI_RLINF = SupportedModel.register("openpi_rlinf", force=True
 SupportedModel.STARVLA = SupportedModel.register("starvla", force=True)
 SupportedModel.MLP_POLICY = SupportedModel.register("mlp_policy", force=True)
 SupportedModel.RLT_MLP_POLICY = SupportedModel.register("rlt_mlp_policy", force=True)
+SupportedModel.RLT_PAPER_MLP_POLICY = SupportedModel.register(
+    "rlt_paper_mlp_policy", force=True
+)
 SupportedModel.RLT_TD3_MLP_POLICY = SupportedModel.register(
     "rlt_td3_mlp_policy", force=True
 )
@@ -136,6 +139,7 @@ EMBODIED_MODEL = set(
         SupportedModel.STARVLA,
         SupportedModel.MLP_POLICY,
         SupportedModel.RLT_MLP_POLICY,
+        SupportedModel.RLT_PAPER_MLP_POLICY,
         SupportedModel.RLT_TD3_MLP_POLICY,
         SupportedModel.GR00T,
         SupportedModel.DEXBOTIC_PI,

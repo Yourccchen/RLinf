@@ -1,3 +1,17 @@
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import numpy as np
 import pytest
 
@@ -101,6 +115,39 @@ def test_feedback_accepts_matching_custom_chunk_len():
     }
     feedback = TransitionFeedback.from_mapping(payload)
     assert feedback.executed_actions.shape == (10, ACTION_DIM)
+
+
+def test_feedback_preserves_stride_intermediate_observations():
+    payload = _feedback("actor")
+    payload["intermediate_observations"] = [
+        {
+            "step_index": index,
+            "states": np.full(ACTION_DIM, index, dtype=np.float32),
+            "main_images": np.zeros((4, 5, 3), dtype=np.uint8),
+            "wrist_images": np.zeros((2, 4, 5, 3), dtype=np.uint8),
+        }
+        for index in (2, 4, 6, 8)
+    ]
+
+    feedback = TransitionFeedback.from_mapping(payload)
+
+    assert [item["step_index"] for item in feedback.intermediate_observations] == [
+        2,
+        4,
+        6,
+        8,
+    ]
+
+
+def test_feedback_rejects_duplicate_intermediate_offsets():
+    payload = _feedback("actor")
+    payload["intermediate_observations"] = [
+        {"step_index": 2},
+        {"step_index": 2},
+    ]
+
+    with pytest.raises(ValueError, match="unique"):
+        TransitionFeedback.from_mapping(payload)
 
 
 def test_feedback_validates_mode_and_terminal_state():

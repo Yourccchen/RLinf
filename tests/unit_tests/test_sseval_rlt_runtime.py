@@ -1,3 +1,17 @@
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import copy
 from pathlib import Path
 
@@ -9,6 +23,9 @@ from omegaconf import OmegaConf
 from rlinf.algorithms.rlt.rollout import validate_rlt_stage2_configs
 from rlinf.data.rlt import build_offline_rlt_trajectories
 from rlinf.envs.remote_songling import SonglingActionCodec
+from rlinf.models.embodiment.mlp_policy.rlt_paper_mlp_policy import (
+    RLTPaperMLPPolicy,
+)
 from rlinf.models.embodiment.mlp_policy.rlt_td3_mlp_policy import RLTTD3MLPPolicy
 from rlinf.serving.sseval_contract import (
     ACTION_DIM,
@@ -80,6 +97,17 @@ def _observation(value=0.0):
     }
 
 
+def _intermediate_observations(*values):
+    return [
+        {
+            "step_index": 2 * (index + 1),
+            "capture_timestamp": float(value),
+            **_observation(float(value)),
+        }
+        for index, value in enumerate(values)
+    ]
+
+
 def _feedback(
     chunk_id=0,
     *,
@@ -138,6 +166,37 @@ def test_runtime_inference_does_not_autosave():
     runtime.close()
 
     assert learner.saved == []
+
+
+def test_runtime_can_sample_gaussian_actor_during_online_collection():
+    torch.manual_seed(0)
+    policy = RLTPaperMLPPolicy(
+        z_dim=8,
+        proprio_dim=14,
+        action_dim=14,
+        num_action_chunks=10,
+        fixed_std=0.2,
+    )
+
+    def make_runtime(sample: bool):
+        return SsEvalRLTRuntime(
+            feature_model=FakeFeatureModel(),
+            active_policy_model=copy.deepcopy(policy),
+            action_codec=SonglingActionCodec([-1.0] * 14, [1.0] * 14),
+            learner=FakeLearner(),
+            chunk_len=10,
+            actor_rollout_sampling=sample,
+        )
+
+    sampled_runtime = make_runtime(True)
+    sampled_runtime.start_episode("sampled", "fold clothes")
+    sampled = sampled_runtime.infer_candidates(_observation()).actor_action
+
+    mean_runtime = make_runtime(False)
+    mean_runtime.start_episode("mean", "fold clothes")
+    mean = mean_runtime.infer_candidates(_observation()).actor_action
+
+    assert not np.allclose(sampled, mean)
 
 
 def _offline_rlt_trajectory(chunk_len: int = 10, model_weights_id: str = "offline"):
@@ -330,6 +389,44 @@ def test_runtime_switches_from_unrecorded_vla50_to_recorded_actor10():
     assert trajectory.curr_obs["ref_chunk"].shape[-2:] == (10, ACTION_DIM)
 
 
+def test_runtime_builds_overlapping_stride_two_transitions():
+    policy = RLTTD3MLPPolicy(
+        z_dim=8,
+        proprio_dim=14,
+        action_dim=14,
+        num_action_chunks=10,
+        actor_noise_sigma=0.0,
+    )
+    learner = FakeLearner()
+    runtime = SsEvalRLTRuntime(
+        feature_model=FakeFeatureModel(),
+        active_policy_model=policy,
+        action_codec=SonglingActionCodec([-1.0] * 14, [1.0] * 14),
+        learner=learner,
+        chunk_len=10,
+        transition_stride=2,
+    )
+    runtime.start_episode("episode-1", "fold clothes")
+    runtime.infer_candidates(_observation(0.0))
+    first_feedback = _feedback(0, chunk_len=10)
+    first_feedback["intermediate_observations"] = _intermediate_observations(2, 4, 6, 8)
+    runtime.infer_candidates(_observation(10.0), first_feedback)
+
+    second_feedback = _feedback(1, chunk_len=10, done=True, reward=1.0)
+    second_feedback["intermediate_observations"] = _intermediate_observations(
+        12, 14, 16, 18
+    )
+    runtime.infer_candidates(_observation(20.0), second_feedback)
+
+    assert len(learner.submitted) == 6
+    starts = [
+        int(trajectory.curr_obs["z_rl"].reshape(-1)[0].item())
+        for trajectory in learner.submitted
+    ]
+    assert starts == [0, 2, 4, 6, 8, 10]
+    assert all(item.actions.shape[-1] == 10 * ACTION_DIM for item in learner.submitted)
+
+
 def test_runtime_records_only_chunks_after_critical_phase_starts():
     runtime, learner = _runtime()
     runtime.start_episode("episode-1", "fold clothes")
@@ -338,14 +435,10 @@ def test_runtime_records_only_chunks_after_critical_phase_starts():
         _observation(1.0),
         _feedback(0, critical_phase=False),
     )
-    runtime.end_episode(
-        _feedback(1, done=True, reward=1.0, critical_phase=True)
-    )
+    runtime.end_episode(_feedback(1, done=True, reward=1.0, critical_phase=True))
 
     assert len(learner.submitted) == 1
-    assert learner.submitted[0].model_weights_id == (
-        "ep-episode-1_chunk-1_actor"
-    )
+    assert learner.submitted[0].model_weights_id == ("ep-episode-1_chunk-1_actor")
     assert learner.submitted[0].forward_inputs["record_transition"].all()
     assert learner.submitted[0].terminations.any()
 
@@ -370,9 +463,7 @@ def test_runtime_drops_labeled_episode_when_critical_phase_never_starts():
     runtime, learner = _runtime()
     runtime.start_episode("episode-1", "fold clothes")
     runtime.infer_candidates(_observation(0.0))
-    runtime.end_episode(
-        _feedback(0, done=True, reward=1.0, critical_phase=False)
-    )
+    runtime.end_episode(_feedback(0, done=True, reward=1.0, critical_phase=False))
 
     assert learner.submitted == []
 
@@ -458,6 +549,45 @@ def test_in_process_learner_runs_utd_and_delays_actor_update():
     learner.close()
 
 
+def test_paper_learner_uses_fixed_bc_regularizer_and_environment_warmup():
+    model = RLTPaperMLPPolicy(
+        z_dim=8,
+        proprio_dim=14,
+        action_dim=14,
+        num_action_chunks=10,
+        fixed_std=0.002,
+    )
+    learner = InProcessRLTTD3Learner(
+        model,
+        InProcessLearnerConfig(
+            batch_size=1,
+            min_buffer_size=1,
+            replay_capacity=8,
+            utd=2,
+            actor_update_interval=2,
+            actor_objective="bc_regularized_q",
+            bc_regularizer_beta=0.5,
+            warmup_transitions=2,
+        ),
+        start_background=False,
+    )
+    trajectory = _offline_rlt_trajectory()
+
+    learner.add_and_train(trajectory)
+
+    assert learner.update_step == 2
+    assert not learner.actor_ready
+    assert learner.take_candidate() is None
+
+    learner.add_and_train(trajectory)
+    assert learner.actor_ready
+    assert learner.last_metrics["bc_weight"] == pytest.approx(0.5)
+    assert learner.last_metrics["q_weight"] == pytest.approx(1.0)
+    assert learner.last_metrics["residual_smoothness_loss"] == pytest.approx(0.0)
+    assert learner.take_candidate() is not None
+    learner.close()
+
+
 def _metrics_learner(**overrides):
     model = RLTTD3MLPPolicy(
         z_dim=8,
@@ -466,14 +596,14 @@ def _metrics_learner(**overrides):
         num_action_chunks=10,
         actor_noise_sigma=0.0,
     )
-    settings = dict(
-        batch_size=2,
-        min_buffer_size=1,
-        replay_capacity=8,
-        utd=1,
-        actor_update_interval=2,
-        warmup_updates=2,
-    )
+    settings = {
+        "batch_size": 2,
+        "min_buffer_size": 1,
+        "replay_capacity": 8,
+        "utd": 1,
+        "actor_update_interval": 2,
+        "warmup_updates": 2,
+    }
     settings.update(overrides)
     return InProcessRLTTD3Learner(
         model, InProcessLearnerConfig(**settings), start_background=False
@@ -659,6 +789,52 @@ def test_in_process_learner_checkpoint_round_trip(tmp_path):
     assert restored.update_step == 2
     assert restored.total_transitions == 1
     assert restored.replay.total_samples == 1
+    assert restored.take_candidate() is not None
+    first.close()
+    restored.close()
+
+
+def test_paper_learner_checkpoint_round_trip(tmp_path):
+    config = InProcessLearnerConfig(
+        batch_size=1,
+        min_buffer_size=1,
+        replay_capacity=8,
+        utd=2,
+        actor_update_interval=2,
+        actor_objective="bc_regularized_q",
+        bc_regularizer_beta=0.5,
+        warmup_transitions=1,
+    )
+
+    def make_learner():
+        return InProcessRLTTD3Learner(
+            RLTPaperMLPPolicy(
+                z_dim=8,
+                proprio_dim=14,
+                action_dim=14,
+                num_action_chunks=10,
+            ),
+            config,
+            start_background=False,
+        )
+
+    first = make_learner()
+    first.add_and_train(_offline_rlt_trajectory())
+    checkpoint = tmp_path / "paper_step"
+    first.save_checkpoint(checkpoint)
+    expected_actor = {
+        key: value.detach().clone()
+        for key, value in first.model.actor.state_dict().items()
+    }
+
+    restored = make_learner()
+    restored.load_checkpoint(checkpoint)
+
+    assert restored.update_step == 2
+    assert restored.actor_ready
+    assert restored.replay.total_samples == 1
+    for key, value in restored.model.actor.state_dict().items():
+        torch.testing.assert_close(value, expected_actor[key])
     assert restored.take_candidate() is not None
     first.close()
     restored.close()
@@ -1095,9 +1271,7 @@ def test_residual_temporal_losses_are_zero_for_constant_residual():
     predicted = reference + 0.25
     valid = torch.ones(2, 6, dtype=torch.bool)
 
-    velocity, acceleration = residual_temporal_losses(
-        predicted, reference, valid
-    )
+    velocity, acceleration = residual_temporal_losses(predicted, reference, valid)
 
     torch.testing.assert_close(velocity, torch.zeros_like(velocity))
     torch.testing.assert_close(acceleration, torch.zeros_like(acceleration))
@@ -1105,15 +1279,11 @@ def test_residual_temporal_losses_are_zero_for_constant_residual():
 
 def test_residual_temporal_losses_penalize_alternating_residual():
     reference = torch.zeros(1, 6, 2)
-    residual = torch.tensor([0.2, -0.2, 0.2, -0.2, 0.2, -0.2]).reshape(
-        1, 6, 1
-    )
+    residual = torch.tensor([0.2, -0.2, 0.2, -0.2, 0.2, -0.2]).reshape(1, 6, 1)
     predicted = reference + residual.expand(-1, -1, 2)
     valid = torch.ones(1, 6, dtype=torch.bool)
 
-    velocity, acceleration = residual_temporal_losses(
-        predicted, reference, valid
-    )
+    velocity, acceleration = residual_temporal_losses(predicted, reference, valid)
 
     assert velocity > 0
     assert acceleration > velocity
@@ -1127,9 +1297,7 @@ def test_residual_temporal_losses_ignore_invalid_tail():
     predicted[:, 5] = 10.0
     valid = torch.tensor([[True, True, True, False, False, False]])
 
-    velocity, acceleration = residual_temporal_losses(
-        predicted, reference, valid
-    )
+    velocity, acceleration = residual_temporal_losses(predicted, reference, valid)
 
     torch.testing.assert_close(velocity, torch.zeros_like(velocity))
     torch.testing.assert_close(acceleration, torch.zeros_like(acceleration))

@@ -115,6 +115,7 @@ class TransitionFeedback:
     rlt_switch_flags: np.ndarray
     actor_version: int
     timestamps: Mapping[str, Any]
+    intermediate_observations: tuple[Mapping[str, Any], ...]
 
     @classmethod
     def from_mapping(
@@ -141,8 +142,7 @@ class TransitionFeedback:
         )
         if actions.shape != expected:
             raise ValueError(
-                "executed_actions must be padded to "
-                f"{expected}, got {actions.shape}."
+                f"executed_actions must be padded to {expected}, got {actions.shape}."
             )
 
         def vector(name: str, dtype: Any) -> np.ndarray:
@@ -167,6 +167,23 @@ class TransitionFeedback:
             )
         if mode is not SelectedMode.HUMAN and intervene[valid].any():
             raise ValueError("Only human-mode steps may set intervene_flags=True.")
+        intermediate = []
+        seen_indices = set()
+        for item in payload.get("intermediate_observations") or []:
+            if not isinstance(item, Mapping):
+                raise ValueError("intermediate_observations entries must be mappings.")
+            step_index = int(item.get("step_index", -1))
+            if (
+                step_index <= 0
+                or step_index >= expected[0]
+                or step_index in seen_indices
+            ):
+                raise ValueError(
+                    "intermediate observation step_index must be unique and within "
+                    f"(0, {expected[0]}), got {step_index}."
+                )
+            seen_indices.add(step_index)
+            intermediate.append(dict(item))
         return cls(
             episode_id=episode_id,
             chunk_id=int(payload.get("chunk_id")),
@@ -180,6 +197,7 @@ class TransitionFeedback:
             rlt_switch_flags=rlt_switch,
             actor_version=int(payload.get("actor_version", 0)),
             timestamps=dict(payload.get("timestamps") or {}),
+            intermediate_observations=tuple(intermediate),
         )
 
     @property

@@ -233,9 +233,7 @@ def align_feature_model_from_sft_config(
 _REPLAY_ID_UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
-def sseval_replay_weights_id(
-    episode_id: str, chunk_id: int, selected_mode: str
-) -> str:
+def sseval_replay_weights_id(episode_id: str, chunk_id: int, selected_mode: str) -> str:
     """Return the replay file suffix for one SsEval transition.
 
     Replay files are ``trajectory_{id}_{model_weights_id}.pt``. The suffix
@@ -350,6 +348,69 @@ def _build_feedback_trajectory(
     )
 
 
+def _build_strided_trajectory(
+    *,
+    episode_id: str,
+    start_step: int,
+    actions: torch.Tensor,
+    rewards: torch.Tensor,
+    terminated: torch.Tensor,
+    truncated: torch.Tensor,
+    valid: torch.Tensor,
+    intervene: torch.Tensor,
+    rlt_switch: torch.Tensor,
+    modes: list[str],
+    actor_versions: list[int],
+    curr_obs: Mapping[str, torch.Tensor],
+    next_obs: Mapping[str, torch.Tensor],
+) -> Trajectory:
+    """Build one overlapping C-step transition from a continuous episode buffer."""
+    mode = modes[0] if len(set(modes)) == 1 else "mixed"
+    curr = {key: value.detach().clone() for key, value in curr_obs.items()}
+    curr["ref_chunk"] = overwrite_rlt_ref_with_human(
+        curr["ref_chunk"].unsqueeze(0),
+        actions.reshape(1, -1),
+        intervene.unsqueeze(0),
+    ).squeeze(0)
+    nxt = {key: value.detach().clone() for key, value in next_obs.items()}
+    return Trajectory(
+        max_episode_length=1,
+        model_weights_id=sseval_replay_weights_id(
+            episode_id,
+            start_step,
+            mode,
+        ),
+        actions=actions.reshape(1, 1, -1),
+        intervene_flags=intervene.reshape(1, 1, -1),
+        rewards=rewards.reshape(1, 1, -1),
+        terminations=terminated.reshape(1, 1, -1),
+        truncations=truncated.reshape(1, 1, -1),
+        dones=(terminated | truncated).reshape(1, 1, -1),
+        versions=torch.full(
+            (1, 1, 1),
+            float(actor_versions[0] if actor_versions else 0),
+        ),
+        forward_inputs={
+            "action": actions.reshape(1, 1, -1),
+            "valid_step_mask": valid.reshape(1, 1, -1),
+            "record_transition": torch.full(
+                (1, 1, 1),
+                bool((rlt_switch & valid).any()),
+                dtype=torch.bool,
+            ),
+            "actor_switch": torch.full(
+                (1, 1, 1),
+                any(item == "actor" for item in modes),
+                dtype=torch.bool,
+            ),
+        },
+        curr_obs={
+            key: value.reshape(1, 1, *value.shape) for key, value in curr.items()
+        },
+        next_obs={key: value.reshape(1, 1, *value.shape) for key, value in nxt.items()},
+    )
+
+
 class SsEvalRLTRuntime:
     """Serial inference facade with a non-blocking asynchronous TD3 learner.
 
@@ -366,12 +427,15 @@ class SsEvalRLTRuntime:
         learner: InProcessRLTTD3Learner,
         reference_seed: int = 2026,
         chunk_len: int | None = None,
+        actor_rollout_sampling: bool = False,
+        transition_stride: int | None = None,
     ) -> None:
         self.feature_model = feature_model.eval().requires_grad_(False)
         self.active_policy_model = active_policy_model.eval().requires_grad_(False)
         self.action_codec = action_codec
         self.learner = learner
         self.reference_seed = int(reference_seed)
+        self.actor_rollout_sampling = bool(actor_rollout_sampling)
         model_chunk_len = int(
             getattr(active_policy_model, "chunk_len", 0)
             or getattr(active_policy_model, "num_action_chunks", 0)
@@ -381,12 +445,31 @@ class SsEvalRLTRuntime:
         if resolved < 1:
             raise ValueError(f"SsEval RLT chunk_len must be positive, got {resolved}.")
         self.chunk_len = resolved
+        self.transition_stride = (
+            resolved if transition_stride is None else int(transition_stride)
+        )
+        if self.transition_stride < 1 or self.transition_stride > self.chunk_len:
+            raise ValueError(
+                "transition_stride must be within [1, chunk_len], got "
+                f"{self.transition_stride} for chunk_len={self.chunk_len}."
+            )
         self._seed_index = 0
         self._episode_id: str | None = None
         self._instruction = ""
         self._next_chunk_id = 0
         self._pending: _PendingInference | None = None
         self._episode_buffer: list[Trajectory] = []
+        self._stride_actions: list[torch.Tensor] = []
+        self._stride_rewards: list[torch.Tensor] = []
+        self._stride_terminated: list[torch.Tensor] = []
+        self._stride_truncated: list[torch.Tensor] = []
+        self._stride_valid: list[torch.Tensor] = []
+        self._stride_intervene: list[torch.Tensor] = []
+        self._stride_switch: list[torch.Tensor] = []
+        self._stride_modes: list[str] = []
+        self._stride_versions: list[int] = []
+        self._stride_features: dict[int, dict[str, torch.Tensor]] = {}
+        self._next_stride_start = 0
         self._seen_feedback: set[tuple[str, int]] = set()
         self._active_actor_version = 0
         self._episode_actor_ready = False
@@ -429,6 +512,10 @@ class SsEvalRLTRuntime:
             learner=learner,
             reference_seed=int(cfg.get("reference_seed", 2026)),
             chunk_len=int(cfg.actor_model.num_action_chunks),
+            actor_rollout_sampling=bool(cfg.get("actor_rollout_sampling", False)),
+            transition_stride=int(
+                cfg.get("transition_stride", cfg.actor_model.num_action_chunks)
+            ),
         )
         apply_sseval_restore(runtime, cfg, config_path)
         return runtime
@@ -460,6 +547,7 @@ class SsEvalRLTRuntime:
             self._pending = None
             self._episode_buffer.clear()
             self._seen_feedback.clear()
+            self._reset_stride_buffers()
             self._episode_actor_ready = bool(self.learner.actor_ready)
             return episode_id
 
@@ -497,6 +585,7 @@ class SsEvalRLTRuntime:
                 actor_ready=self._episode_actor_ready,
                 actor_version=self._active_actor_version,
                 reference_seed=seed,
+                actor_mode="train" if self.actor_rollout_sampling else "eval",
             )
             actor_expected = songling_chunk_shape(self.chunk_len)
             if candidates.actor_action.shape != actor_expected:
@@ -533,6 +622,130 @@ class SsEvalRLTRuntime:
             self._seed_index += 1
             return candidates
 
+    @torch.no_grad()
+    def _extract_intermediate_features(
+        self,
+        feedback: TransitionFeedback,
+    ) -> dict[int, dict[str, torch.Tensor]]:
+        observations = sorted(
+            feedback.intermediate_observations,
+            key=lambda item: int(item["step_index"]),
+        )
+        expected = set(
+            range(self.transition_stride, self.chunk_len, self.transition_stride)
+        )
+        received = {int(item["step_index"]) for item in observations}
+        if not received.issubset(expected):
+            raise ValueError(
+                "Stride-subsampled feedback contains unexpected observation offsets; "
+                f"expected a subset of {sorted(expected)}, got {sorted(received)}."
+            )
+        if not observations:
+            return {}
+        singles = [
+            _single_observation(item, self._instruction) for item in observations
+        ]
+        env_obs = {
+            "states": torch.cat([item["states"] for item in singles], dim=0),
+            "main_images": torch.cat([item["main_images"] for item in singles], dim=0),
+            "wrist_images": torch.cat(
+                [item["wrist_images"] for item in singles], dim=0
+            ),
+            "task_descriptions": [item["task_descriptions"][0] for item in singles],
+        }
+        device = next(self.feature_model.parameters()).device
+        generator = torch.Generator(device=device)
+        generator.manual_seed(self.reference_seed + self._seed_index)
+        extracted = self.feature_model.extract_rlt_obs(env_obs, rng=generator)
+        reference_horizon = int(
+            getattr(self.active_policy_model, "ref_chunk_len", self.chunk_len)
+        )
+        normalized = dict(extracted)
+        normalized["ref_chunk"] = self.action_codec.encode(
+            extracted["ref_chunk"][..., :reference_horizon, :],
+            clip=True,
+        )
+        return {
+            int(observation["step_index"]): {
+                key: value[index].detach().to(torch.float32).cpu().contiguous()
+                for key, value in normalized.items()
+                if key in ("z_rl", "proprio", "ref_chunk")
+            }
+            for index, observation in enumerate(observations)
+        }
+
+    def _append_strided_feedback(
+        self,
+        pending: _PendingInference,
+        next_obs: Mapping[str, torch.Tensor],
+        feedback: TransitionFeedback,
+    ) -> None:
+        base_step = len(self._stride_actions)
+        self._stride_features[base_step] = _unbatch_replay_obs(pending.replay_obs)
+        for offset, feature in self._extract_intermediate_features(feedback).items():
+            self._stride_features[base_step + offset] = feature
+        self._stride_features[base_step + self.chunk_len] = _unbatch_replay_obs(
+            next_obs
+        )
+
+        normalized_actions = torch.as_tensor(
+            self.action_codec.encode(feedback.executed_actions, clip=True),
+            dtype=torch.float32,
+        )
+        vectors = (
+            (self._stride_actions, normalized_actions),
+            (self._stride_rewards, torch.from_numpy(feedback.rewards).float()),
+            (
+                self._stride_terminated,
+                torch.from_numpy(feedback.terminated).bool(),
+            ),
+            (self._stride_truncated, torch.from_numpy(feedback.truncated).bool()),
+            (self._stride_valid, torch.from_numpy(feedback.valid_step_mask).bool()),
+            (
+                self._stride_intervene,
+                torch.from_numpy(feedback.intervene_flags).bool(),
+            ),
+            (
+                self._stride_switch,
+                torch.from_numpy(feedback.rlt_switch_flags).bool(),
+            ),
+        )
+        for target, values in vectors:
+            target.extend(value.detach().cpu() for value in values)
+        self._stride_modes.extend([feedback.selected_mode.value] * self.chunk_len)
+        self._stride_versions.extend([pending.actor_version] * self.chunk_len)
+
+        total_steps = len(self._stride_actions)
+        while self._next_stride_start + self.chunk_len <= total_steps:
+            start = self._next_stride_start
+            stop = start + self.chunk_len
+            self._next_stride_start += self.transition_stride
+            curr = self._stride_features.get(start)
+            nxt = self._stride_features.get(stop)
+            if curr is None or nxt is None:
+                continue
+            valid = torch.stack(self._stride_valid[start:stop])
+            rlt_switch = torch.stack(self._stride_switch[start:stop])
+            if not bool((valid & rlt_switch).any()):
+                continue
+            self._episode_buffer.append(
+                _build_strided_trajectory(
+                    episode_id=pending.episode_id,
+                    start_step=start,
+                    actions=torch.stack(self._stride_actions[start:stop]),
+                    rewards=torch.stack(self._stride_rewards[start:stop]),
+                    terminated=torch.stack(self._stride_terminated[start:stop]),
+                    truncated=torch.stack(self._stride_truncated[start:stop]),
+                    valid=valid,
+                    intervene=torch.stack(self._stride_intervene[start:stop]),
+                    rlt_switch=rlt_switch,
+                    modes=self._stride_modes[start:stop],
+                    actor_versions=self._stride_versions[start:stop],
+                    curr_obs=curr,
+                    next_obs=nxt,
+                )
+            )
+
     def _ingest_feedback(
         self, feedback: TransitionFeedback, next_obs: Mapping[str, torch.Tensor]
     ) -> bool:
@@ -550,6 +763,8 @@ class SsEvalRLTRuntime:
             (feedback.rlt_switch_flags & feedback.valid_step_mask).any()
         )
         if not should_record:
+            if self.transition_stride < self.chunk_len:
+                self._reset_stride_buffers()
             self._seen_feedback.add(feedback.key)
             if feedback.done:
                 self._resolve_episode_buffer(feedback)
@@ -560,16 +775,19 @@ class SsEvalRLTRuntime:
                 f"{songling_chunk_shape(self.chunk_len)}, got "
                 f"{feedback.executed_actions.shape}."
             )
-        trajectory = _build_feedback_trajectory(
-            pending, next_obs, feedback, self.action_codec
-        )
-        if bool(
-            trajectory.forward_inputs["record_transition"]
-            .detach()
-            .to(torch.bool)
-            .all()
-        ):
-            self._episode_buffer.append(trajectory)
+        if self.transition_stride < self.chunk_len:
+            self._append_strided_feedback(pending, next_obs, feedback)
+        else:
+            trajectory = _build_feedback_trajectory(
+                pending, next_obs, feedback, self.action_codec
+            )
+            if bool(
+                trajectory.forward_inputs["record_transition"]
+                .detach()
+                .to(torch.bool)
+                .all()
+            ):
+                self._episode_buffer.append(trajectory)
         self._seen_feedback.add(feedback.key)
         if feedback.done:
             self._resolve_episode_buffer(feedback)
@@ -612,6 +830,20 @@ class SsEvalRLTRuntime:
         self._instruction = ""
         self._pending = None
         self._episode_buffer.clear()
+        self._reset_stride_buffers()
+
+    def _reset_stride_buffers(self) -> None:
+        self._stride_actions.clear()
+        self._stride_rewards.clear()
+        self._stride_terminated.clear()
+        self._stride_truncated.clear()
+        self._stride_valid.clear()
+        self._stride_intervene.clear()
+        self._stride_switch.clear()
+        self._stride_modes.clear()
+        self._stride_versions.clear()
+        self._stride_features.clear()
+        self._next_stride_start = 0
 
     def end_episode(self, final_feedback: Mapping[str, Any]) -> bool:
         with self._lock:
