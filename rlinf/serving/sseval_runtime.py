@@ -583,6 +583,30 @@ class SsEvalRLTRuntime:
         for trajectory in trajectories:
             self.learner.submit(trajectory)
 
+    def _relabel_buffered_terminal(self, feedback: TransitionFeedback) -> bool:
+        weights_id = sseval_replay_weights_id(
+            feedback.episode_id,
+            feedback.chunk_id,
+            feedback.selected_mode.value,
+        )
+        for trajectory in reversed(self._episode_buffer):
+            if trajectory.model_weights_id != weights_id:
+                continue
+            shape = trajectory.rewards.shape
+            device = trajectory.rewards.device
+            trajectory.rewards = torch.as_tensor(
+                feedback.rewards, dtype=torch.float32, device=device
+            ).reshape(shape)
+            trajectory.terminations = torch.as_tensor(
+                feedback.terminated, dtype=torch.bool, device=device
+            ).reshape(shape)
+            trajectory.truncations = torch.as_tensor(
+                feedback.truncated, dtype=torch.bool, device=device
+            ).reshape(shape)
+            trajectory.dones = trajectory.terminations | trajectory.truncations
+            return True
+        return False
+
     def _close_episode(self) -> None:
         self._episode_id = None
         self._instruction = ""
@@ -592,11 +616,29 @@ class SsEvalRLTRuntime:
     def end_episode(self, final_feedback: Mapping[str, Any]) -> bool:
         with self._lock:
             self._require_open()
-            if self._episode_id is None or self._pending is None:
+            if self._episode_id is None:
                 raise RuntimeError("No active SsEval RLT episode to end.")
             feedback = TransitionFeedback.from_mapping(final_feedback)
             if not feedback.done:
                 raise ValueError("end_episode requires terminal or truncated feedback.")
+            if feedback.key in self._seen_feedback:
+                should_record = bool(
+                    (feedback.rlt_switch_flags & feedback.valid_step_mask).any()
+                )
+                if (
+                    should_record
+                    and feedback.has_labeled_outcome
+                    and not self._relabel_buffered_terminal(feedback)
+                ):
+                    raise ValueError(
+                        "Terminal feedback refers to a recorded chunk that is "
+                        "missing from the episode buffer."
+                    )
+                self._resolve_episode_buffer(feedback)
+                self._close_episode()
+                return False
+            if self._pending is None:
+                raise RuntimeError("No pending SsEval RLT action to end.")
             ingested = self._ingest_feedback(feedback, self._pending.replay_obs)
             self._close_episode()
             return ingested

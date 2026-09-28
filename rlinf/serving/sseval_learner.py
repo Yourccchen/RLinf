@@ -612,7 +612,9 @@ class InProcessRLTTD3Learner:
             torch.random.set_rng_state(state["torch_rng_state"].cpu())
             cuda_state = state.get("cuda_rng_state_all")
             if torch.cuda.is_available() and cuda_state is not None:
-                torch.cuda.set_rng_state_all(cuda_state)
+                torch.cuda.set_rng_state_all(
+                    [rng_state.cpu() for rng_state in cuda_state]
+                )
             self.replay.clear()
             self.replay.load_checkpoint(str(root / "replay"))
             self._last_saved_step = self.update_step

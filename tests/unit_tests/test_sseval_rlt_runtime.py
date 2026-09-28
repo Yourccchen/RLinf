@@ -350,6 +350,22 @@ def test_runtime_records_only_chunks_after_critical_phase_starts():
     assert learner.submitted[0].terminations.any()
 
 
+def test_runtime_relabels_duplicate_feedback_as_terminal_during_inference_gap():
+    runtime, learner = _runtime()
+    runtime.start_episode("episode-1", "fold clothes")
+    runtime.infer_candidates(_observation(0.0))
+    runtime.infer_candidates(_observation(1.0), _feedback(0))
+
+    ingested = runtime.end_episode(_feedback(0, done=True, reward=1.0))
+
+    assert not ingested
+    assert len(learner.submitted) == 1
+    trajectory = learner.submitted[0]
+    assert trajectory.rewards[..., -1].item() == 1.0
+    assert trajectory.terminations[..., -1].item()
+    assert trajectory.dones[..., -1].item()
+
+
 def test_runtime_drops_labeled_episode_when_critical_phase_never_starts():
     runtime, learner = _runtime()
     runtime.start_episode("episode-1", "fold clothes")
