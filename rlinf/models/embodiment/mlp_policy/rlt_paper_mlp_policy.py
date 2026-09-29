@@ -22,33 +22,57 @@ from torch.distributions import Normal
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 from rlinf.models.embodiment.mlp_policy.rlt_td3_mlp_policy import (
-    TwinQCritic,
     _make_td3_mlp,
+    _zero_init_last_linear,
 )
 
 
+class RLTInputProjection(nn.Module):
+    """Project one RLT input branch to a normalized shared feature scale."""
+
+    def __init__(self, input_dim: int, projection_dim: int) -> None:
+        super().__init__()
+        self.linear = nn.Linear(int(input_dim), int(projection_dim))
+        self.norm = nn.LayerNorm(int(projection_dim))
+        self.activation = nn.ReLU()
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return self.activation(self.norm(self.linear(value)))
+
+
 class RLTPaperGaussianActor(nn.Module):
-    """Predict a direct Gaussian action chunk conditioned on the VLA proposal."""
+    """Predict a Gaussian action chunk or residual conditioned on the VLA proposal."""
 
     def __init__(
         self,
         *,
-        state_dim: int,
+        z_dim: int,
+        proprio_dim: int,
         action_chunk_dim: int,
+        projection_dim: int = 128,
         hidden_dim: int = 256,
         num_hidden_layers: int = 2,
         fixed_std: float = 0.002,
+        residual: bool = False,
     ) -> None:
         super().__init__()
         self.fixed_std = float(fixed_std)
+        self.residual = bool(residual)
         if self.fixed_std <= 0.0:
             raise ValueError(f"fixed_std must be positive, got {self.fixed_std}.")
+        self.z_dim = int(z_dim)
+        self.proprio_dim = int(proprio_dim)
+        self.z_projection = RLTInputProjection(self.z_dim, projection_dim)
+        self.proprio_projection = RLTInputProjection(self.proprio_dim, projection_dim)
+        self.reference_projection = RLTInputProjection(action_chunk_dim, projection_dim)
         self.mlp = _make_td3_mlp(
-            input_dim=int(action_chunk_dim) + int(state_dim),
+            input_dim=3 * int(projection_dim),
             output_dim=int(action_chunk_dim),
             hidden_dim=int(hidden_dim),
             num_hidden_layers=int(num_hidden_layers),
         )
+        if self.residual:
+            _zero_init_last_linear(self.mlp)
 
     @staticmethod
     def _drop_reference(
@@ -74,13 +98,23 @@ class RLTPaperGaussianActor(nn.Module):
         reference_dropout_prob: float = 0.0,
         apply_action_noise: bool | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return tanh-squashed actions and pre-squash Gaussian log-probabilities."""
+        """Return bounded actions and Gaussian sample log-probabilities."""
         actor_reference = (
             self._drop_reference(reference, float(reference_dropout_prob))
             if apply_reference_dropout
             else reference
         )
-        mean = self.mlp(torch.cat([actor_reference, state], dim=-1))
+        z, proprio = torch.split(state, [self.z_dim, self.proprio_dim], dim=-1)
+        mean = self.mlp(
+            torch.cat(
+                [
+                    self.z_projection(z),
+                    self.proprio_projection(proprio),
+                    self.reference_projection(actor_reference),
+                ],
+                dim=-1,
+            )
+        )
         use_noise = (
             (not deterministic)
             if apply_action_noise is None
@@ -88,8 +122,91 @@ class RLTPaperGaussianActor(nn.Module):
         )
         use_noise = use_noise and not deterministic
         distribution = Normal(mean, torch.full_like(mean, self.fixed_std))
-        pre_tanh = distribution.rsample() if use_noise else mean
-        return torch.tanh(pre_tanh), distribution.log_prob(pre_tanh)
+        sample = distribution.rsample() if use_noise else mean
+        action = reference + sample if self.residual else torch.tanh(sample)
+        return action.clamp(-1.0, 1.0), distribution.log_prob(sample)
+
+
+class RLTProjectedQNetwork(nn.Module):
+    """Score actions after separately projecting every RLT input branch."""
+
+    def __init__(
+        self,
+        *,
+        z_dim: int,
+        proprio_dim: int,
+        action_chunk_dim: int,
+        projection_dim: int = 128,
+        hidden_dim: int = 256,
+        num_hidden_layers: int = 2,
+    ) -> None:
+        super().__init__()
+        self.z_projection = RLTInputProjection(z_dim, projection_dim)
+        self.proprio_projection = RLTInputProjection(proprio_dim, projection_dim)
+        self.reference_projection = RLTInputProjection(action_chunk_dim, projection_dim)
+        self.action_projection = RLTInputProjection(action_chunk_dim, projection_dim)
+        self.mlp = _make_td3_mlp(
+            input_dim=4 * int(projection_dim),
+            output_dim=1,
+            hidden_dim=int(hidden_dim),
+            num_hidden_layers=int(num_hidden_layers),
+        )
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        proprio: torch.Tensor,
+        reference: torch.Tensor,
+        action: torch.Tensor,
+    ) -> torch.Tensor:
+        projected = (
+            self.z_projection(z),
+            self.proprio_projection(proprio),
+            self.reference_projection(reference),
+            self.action_projection(action),
+        )
+        return self.mlp(torch.cat(projected, dim=-1))
+
+
+class RLTProjectedTwinQCritic(nn.Module):
+    """Independent projected twin-Q networks conditioned on the VLA reference."""
+
+    def __init__(
+        self,
+        *,
+        z_dim: int,
+        proprio_dim: int,
+        action_chunk_dim: int,
+        projection_dim: int = 128,
+        hidden_dim: int = 256,
+        num_hidden_layers: int = 2,
+    ) -> None:
+        super().__init__()
+        kwargs = {
+            "z_dim": z_dim,
+            "proprio_dim": proprio_dim,
+            "action_chunk_dim": action_chunk_dim,
+            "projection_dim": projection_dim,
+            "hidden_dim": hidden_dim,
+            "num_hidden_layers": num_hidden_layers,
+        }
+        self.q1 = RLTProjectedQNetwork(**kwargs)
+        self.q2 = RLTProjectedQNetwork(**kwargs)
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        proprio: torch.Tensor,
+        reference: torch.Tensor,
+        action: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.cat(
+            [
+                self.q1(z, proprio, reference, action),
+                self.q2(z, proprio, reference, action),
+            ],
+            dim=-1,
+        )
 
 
 class RLTPaperMLPPolicy(nn.Module, BasePolicy):
@@ -107,6 +224,8 @@ class RLTPaperMLPPolicy(nn.Module, BasePolicy):
         mlp_hidden_dim: int = 256,
         mlp_num_hidden_layers: int = 2,
         fixed_std: float = 0.002,
+        actor_residual: bool = False,
+        projection_dim: int = 128,
     ) -> None:
         super().__init__()
         if not add_q_head:
@@ -134,18 +253,28 @@ class RLTPaperMLPPolicy(nn.Module, BasePolicy):
         self.num_action_chunks = self.chunk_len
         self.flat_action_dim = self.chunk_len * self.step_action_dim
         self.state_dim = self.z_dim + self.proprio_dim
+        self.projection_dim = int(projection_dim)
+        if self.projection_dim <= 0:
+            raise ValueError(
+                f"projection_dim must be positive, got {self.projection_dim}."
+            )
         self.torch_compile_enabled = False
 
         self.actor = RLTPaperGaussianActor(
-            state_dim=self.state_dim,
+            z_dim=self.z_dim,
+            proprio_dim=self.proprio_dim,
             action_chunk_dim=self.flat_action_dim,
+            projection_dim=self.projection_dim,
             hidden_dim=mlp_hidden_dim,
             num_hidden_layers=mlp_num_hidden_layers,
             fixed_std=fixed_std,
+            residual=actor_residual,
         )
-        self.q_head = TwinQCritic(
-            state_dim=self.state_dim,
+        self.q_head = RLTProjectedTwinQCritic(
+            z_dim=self.z_dim,
+            proprio_dim=self.proprio_dim,
             action_chunk_dim=self.flat_action_dim,
+            projection_dim=self.projection_dim,
             hidden_dim=mlp_hidden_dim,
             num_hidden_layers=mlp_num_hidden_layers,
         )
@@ -258,10 +387,19 @@ class RLTPaperMLPPolicy(nn.Module, BasePolicy):
         detach_encoder: bool = False,
     ) -> torch.Tensor:
         del shared_feature
-        state = self._state(obs)
+        z = self._get_z(obs)
+        proprio = self._get_proprio(obs)
+        reference = self._get_ref_chunk(obs)
         if detach_encoder:
-            state = state.detach()
-        return self.q_head(state, self._format_chunk_actions(actions).flatten(1))
+            z = z.detach()
+            proprio = proprio.detach()
+            reference = reference.detach()
+        return self.q_head(
+            z,
+            proprio,
+            reference,
+            self._format_chunk_actions(actions).flatten(1),
+        )
 
     def crossq_q_forward(
         self,

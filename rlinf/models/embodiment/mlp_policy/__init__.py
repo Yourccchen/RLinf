@@ -53,6 +53,8 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
             mlp_hidden_dim=cfg.get("mlp_hidden_dim", 256),
             mlp_num_hidden_layers=cfg.get("mlp_num_hidden_layers", 2),
             fixed_std=cfg.get("fixed_std", 0.002),
+            actor_residual=cfg.get("actor_residual", False),
+            projection_dim=cfg.get("projection_dim", 128),
         )
     elif cfg.model_type == "rlt_td3_mlp_policy":
         model = RLTTD3MLPPolicy(

@@ -321,6 +321,30 @@ def test_paper_actor_reference_dropout_removes_reference_pass_through():
     torch.testing.assert_close(actions_a, actions_b)
 
 
+def test_paper_residual_actor_starts_from_reference_chunk():
+    policy = RLTPaperMLPPolicy(
+        z_dim=2,
+        proprio_dim=2,
+        action_dim=1,
+        num_action_chunks=2,
+        fixed_std=0.002,
+        actor_residual=True,
+    )
+    obs = {
+        "z_rl": torch.randn(3, 2),
+        "proprio": torch.randn(3, 2),
+        "ref_chunk": torch.tensor([[[-0.5], [0.25]], [[0.1], [0.8]], [[-0.9], [0.0]]]),
+    }
+
+    actions, _, _ = policy(
+        forward_type=ForwardType.SAC,
+        obs=obs,
+        deterministic=True,
+    )
+
+    torch.testing.assert_close(actions.reshape_as(obs["ref_chunk"]), obs["ref_chunk"])
+
+
 def test_paper_get_model_wires_configurable_gaussian_actor():
     from rlinf.models.embodiment.mlp_policy import get_model as get_mlp_model
 
@@ -333,7 +357,9 @@ def test_paper_get_model_wires_configurable_gaussian_actor():
             "num_action_chunks": 3,
             "mlp_hidden_dim": 32,
             "mlp_num_hidden_layers": 2,
+            "projection_dim": 16,
             "fixed_std": 0.03,
+            "actor_residual": True,
         }
     )
     model = get_mlp_model(cfg)
@@ -345,8 +371,48 @@ def test_paper_get_model_wires_configurable_gaussian_actor():
 
     assert len(linear_layers) == 3
     assert linear_layers[0].out_features == 32
+    assert model.projection_dim == 16
+    assert model.actor.z_projection.linear.out_features == 16
+    assert model.q_head.q1.action_projection.linear.out_features == 16
     assert model.actor.fixed_std == pytest.approx(0.03)
+    assert model.actor.residual is True
     assert all(not key.startswith("q_head") for key in model.actor.state_dict())
+
+
+def test_paper_critic_projects_all_branches_and_uses_reference():
+    torch.manual_seed(0)
+    policy = RLTPaperMLPPolicy(
+        z_dim=8,
+        proprio_dim=4,
+        action_dim=2,
+        num_action_chunks=3,
+        projection_dim=6,
+    )
+    obs = {
+        "z_rl": torch.randn(4, 8),
+        "proprio": torch.randn(4, 4),
+        "ref_chunk": torch.randn(4, 3, 2),
+    }
+    actions = torch.randn(4, 6).clamp(-1.0, 1.0)
+    q_values = policy(
+        forward_type=ForwardType.SAC_Q,
+        obs=obs,
+        actions=actions,
+    )
+    changed_reference = copy.deepcopy(obs)
+    changed_reference["ref_chunk"] = obs["ref_chunk"] + 0.5
+    changed_q = policy(
+        forward_type=ForwardType.SAC_Q,
+        obs=changed_reference,
+        actions=actions,
+    )
+
+    assert q_values.shape == (4, 2)
+    assert not torch.allclose(q_values, changed_q)
+    assert policy.q_head.q1.z_projection.linear.out_features == 6
+    assert policy.q_head.q1.proprio_projection.linear.out_features == 6
+    assert policy.q_head.q1.reference_projection.linear.out_features == 6
+    assert policy.q_head.q1.action_projection.linear.out_features == 6
 
 
 def _songling_eval_wrapper() -> OpenPiPytorchEvalActionModel:
