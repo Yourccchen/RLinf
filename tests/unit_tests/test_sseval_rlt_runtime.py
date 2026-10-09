@@ -262,6 +262,10 @@ def test_learner_autosaves_every_save_interval_update_steps(tmp_path):
     assert not (run_dir / "step_3").exists()
     assert not (tmp_path / "step_2").exists()
     learner.close()
+    log_text = (run_dir / "training.log").read_text()
+    assert "SsEval checkpoints and training log will be written under" in log_text
+    assert "Saving SsEval checkpoint at update_step 2" in log_text
+    assert "Saving SsEval checkpoint at update_step 4" in log_text
 
 
 def test_learner_close_force_saves_remainder(tmp_path):
@@ -556,7 +560,16 @@ def test_paper_learner_uses_fixed_bc_regularizer_and_environment_warmup():
         action_dim=14,
         num_action_chunks=10,
         fixed_std=0.002,
+        actor_residual=True,
     )
+    final_layer = [
+        module
+        for module in model.actor.mlp.modules()
+        if isinstance(module, torch.nn.Linear)
+    ][-1]
+    with torch.no_grad():
+        alternating = torch.tensor([0.2, -0.2] * 5).repeat_interleave(14)
+        final_layer.bias.copy_(alternating)
     learner = InProcessRLTTD3Learner(
         model,
         InProcessLearnerConfig(
@@ -568,6 +581,8 @@ def test_paper_learner_uses_fixed_bc_regularizer_and_environment_warmup():
             actor_objective="bc_regularized_q",
             bc_regularizer_beta=0.5,
             warmup_transitions=2,
+            residual_velocity_weight=0.5,
+            residual_acceleration_weight=0.1,
         ),
         start_background=False,
     )
@@ -583,7 +598,11 @@ def test_paper_learner_uses_fixed_bc_regularizer_and_environment_warmup():
     assert learner.actor_ready
     assert learner.last_metrics["bc_weight"] == pytest.approx(0.5)
     assert learner.last_metrics["q_weight"] == pytest.approx(1.0)
-    assert learner.last_metrics["residual_smoothness_loss"] == pytest.approx(0.0)
+    assert learner.last_metrics["residual_smoothness_loss"] > 0.0
+    assert learner.last_metrics["residual_smoothness_loss"] == pytest.approx(
+        0.5 * learner.last_metrics["residual_velocity_loss"]
+        + 0.1 * learner.last_metrics["residual_acceleration_loss"]
+    )
     assert learner.take_candidate() is not None
     learner.close()
 
@@ -622,7 +641,14 @@ def test_learner_metrics_expose_actor_objective_terms():
     assert critic_only["actor_updated"] == 0.0
     assert with_actor["actor_updated"] == 1.0
     assert with_actor["bc_weight"] == 7.0
-    for key in ("bc_loss", "q_pi", "residual_abs_mean", "target_q"):
+    for key in (
+        "bc_loss",
+        "q_pi",
+        "residual_abs_mean",
+        "target_q",
+        "shuffle_action",
+        "shuffle_z_rl",
+    ):
         assert with_actor[key] == with_actor[key]
     learner.close()
 
