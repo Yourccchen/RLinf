@@ -1138,3 +1138,61 @@ def test_residual_temporal_losses_ignore_invalid_tail():
 def test_learner_rejects_negative_residual_smoothness_weights():
     with pytest.raises(ValueError, match="residual_velocity_weight"):
         InProcessLearnerConfig.from_mapping({"residual_velocity_weight": -0.1})
+
+
+def test_external_feature_provider_preserves_observation_and_lifecycle(tmp_path):
+    class ExternalFeatureModel(FakeFeatureModel):
+        supports_replay_restore = False
+
+        def __init__(self):
+            super().__init__()
+            self.events = []
+
+        def validate_config(self, actor, codec):
+            assert actor.z_dim == 8
+            self.events.append("validate")
+
+        def prepare_observation(self, observation, instruction):
+            assert observation["history"].shape == (3, 4, 5, 3)
+            assert instruction == "fold clothes"
+            self.events.append("prepare")
+            return {"states": torch.zeros(1, 14)}
+
+        def start_episode(self, episode_id):
+            self.events.append(episode_id)
+
+        def reset(self):
+            self.events.append("reset")
+
+        def close(self):
+            self.events.append("close")
+
+        def get_wire_config(self):
+            return {"video_length": -1, "video_action_rate": 2,
+                    "image_format": "jpeg", "jpeg_quality": 95}
+
+    config = {
+        "device": "cpu",
+        "actor_model": {"model_type": "rlt_td3_mlp_policy", "precision": "fp32",
+                        "z_dim": 8, "proprio_dim": 14, "action_dim": 14,
+                        "num_action_chunks": CHUNK_LEN, "mlp_hidden_dim": 16,
+                        "mlp_num_hidden_layers": 1, "add_q_head": True,
+                        "is_lora": False, "policy_setup": "songling-absolute-qpos"},
+        "action_codec": {"action_low": [-1.] * 14, "action_high": [1.] * 14},
+        "learner": {"min_buffer_size": 100},
+    }
+    path = tmp_path / "runtime.yaml"
+    OmegaConf.save(OmegaConf.create(config), path)
+    provider = ExternalFeatureModel()
+    runtime = SsEvalRLTRuntime.from_config(path, feature_model=provider)
+    try:
+        assert runtime.get_wire_config()["video_length"] == -1
+        runtime.start_episode("episode-soma", "fold clothes")
+        runtime.infer_candidates({"history": np.zeros((3, 4, 5, 3), np.uint8)})
+        runtime.reset()
+        with pytest.raises(ValueError, match="restore"):
+            runtime.load_checkpoint(tmp_path)
+    finally:
+        runtime.close()
+        runtime.close()
+    assert provider.events == ["validate", "episode-soma", "prepare", "reset", "close"]

@@ -1,0 +1,40 @@
+# Loaded with RWI's optional soma provider. No OpenPI feature_model is built.
+# Verify physical qpos layout/units against the actual Piper Soma action profile.
+# Fresh Actor only; pi0.5 Actor and replay restoration are incompatible.
+device: cuda
+reference_seed: 2026
+actor_checkpoint: null
+replay_checkpoint: null
+save_interval: 0
+
+action_codec:
+  action_low: [-2.617994, 0.0, -2.967060, -1.745330, -1.221730, -2.094396, 0.0, -2.617994, 0.0, -2.967060, -1.745330, -1.221730, -2.094396, 0.0]
+  action_high: [2.617994, 3.141593, 0.0, 1.745330, 1.221730, 2.094396, 100.0, 2.617994, 3.141593, 0.0, 1.745330, 1.221730, 2.094396, 100.0]
+
+actor_model:
+  model_type: rlt_td3_mlp_policy
+  precision: fp32
+  policy_setup: songling-absolute-qpos
+  z_dim: 512
+  proprio_dim: 14
+  action_dim: 14
+  num_action_chunks: 10
+  add_value_head: false
+  add_q_head: true
+  q_head_type: default
+  mlp_hidden_dim: 256
+  mlp_num_hidden_layers: 2
+  # Residual actor: execute clamp(VLA_ref + mlp). Last layer starts at 0 so
+  # an untrained policy copies the VLA chunk. Do not load a previous
+  # direct-reconstruction learner.pt or any pi0.5 replay.
+  actor_residual: true
+  actor_noise_sigma: 0.1
+  ref_action_dropout: 0.5
+  is_lora: false
+
+# Integration defaults. Online TD3 tuning and execution validation are a later step.
+learner:
+  min_buffer_size: 1000
+  batch_size: 64
+  replay_capacity: 50000
+  warmup_updates: 5000

@@ -394,15 +394,26 @@ class SsEvalRLTRuntime:
         self._closed = False
 
     @classmethod
-    def from_config(cls, config_path: str | Path) -> "SsEvalRLTRuntime":
+    def from_config(
+        cls, config_path: str | Path, *, feature_model: Any = None
+    ) -> "SsEvalRLTRuntime":
         cfg = OmegaConf.load(str(config_path))
-        align_feature_model_from_sft_config(cfg, config_path)
+        if feature_model is None:
+            align_feature_model_from_sft_config(cfg, config_path)
         OmegaConf.resolve(cfg)
-        validate_rlt_stage2_configs(cfg.actor_model, cfg.feature_model)
         device = torch.device(str(cfg.get("device", "cuda")))
-        feature_model = get_model(copy.deepcopy(cfg.feature_model)).to(device).eval()
-        active_model = get_model(copy.deepcopy(cfg.actor_model)).to(device).eval()
         codec = SonglingActionCodec.from_config(cfg.action_codec)
+        if feature_model is None:
+            validate_rlt_stage2_configs(cfg.actor_model, cfg.feature_model)
+            feature_model = get_model(copy.deepcopy(cfg.feature_model)).to(device).eval()
+        else:
+            if (cfg.get("actor_checkpoint") or cfg.get("replay_checkpoint")) and not getattr(
+                feature_model, "supports_replay_restore", True
+            ):
+                raise ValueError("This feature provider does not support actor/replay restore yet")
+            feature_model.validate_config(cfg.actor_model, codec)
+            feature_model = feature_model.to(device).eval()
+        active_model = get_model(copy.deepcopy(cfg.actor_model)).to(device).eval()
         learner_model = copy.deepcopy(active_model).train().requires_grad_(True)
         learner_cfg = InProcessLearnerConfig.from_mapping(
             OmegaConf.to_container(cfg.get("learner", {}), resolve=True)
@@ -453,6 +464,8 @@ class SsEvalRLTRuntime:
             instruction = str(instruction).strip()
             if not instruction:
                 raise ValueError("SsEval RLT instruction must be non-empty.")
+            if hasattr(self.feature_model, "start_episode"):
+                self.feature_model.start_episode(episode_id)
             self._activate_candidate_actor()
             self._episode_id = episode_id
             self._instruction = instruction
@@ -484,7 +497,8 @@ class SsEvalRLTRuntime:
             self.learner.raise_if_failed()
             if self._episode_id is None:
                 raise RuntimeError("start_episode() must be called before inference.")
-            env_obs = _single_observation(observation, self._instruction)
+            prepare = getattr(self.feature_model, "prepare_observation", _single_observation)
+            env_obs = prepare(observation, self._instruction)
             chunk_id = self._next_chunk_id
             seed = self.reference_seed + self._seed_index
             candidates, replay_obs = predict_rlt_candidates(
@@ -648,8 +662,12 @@ class SsEvalRLTRuntime:
             self._close_episode()
             self._next_chunk_id = 0
             self._seen_feedback.clear()
+            if hasattr(self.feature_model, "reset"):
+                self.feature_model.reset()
 
     def get_wire_config(self) -> dict[str, Any]:
+        if hasattr(self.feature_model, "get_wire_config"):
+            return self.feature_model.get_wire_config()
         return {
             "video_action_rate": 1,
             "video_length": 1,
@@ -683,6 +701,8 @@ class SsEvalRLTRuntime:
             self._require_open()
             if self._episode_id is not None:
                 raise RuntimeError("Checkpoint restore requires an episode boundary.")
+            if not getattr(self.feature_model, "supports_replay_restore", True):
+                raise ValueError("This feature provider does not support actor/replay restore yet")
             checkpoint_dir = resolve_sseval_checkpoint_dir(path)
             self.learner.load_checkpoint(checkpoint_dir)
             self.active_policy_model.load_state_dict(
@@ -697,6 +717,8 @@ class SsEvalRLTRuntime:
             self._require_open()
             if self._episode_id is not None:
                 raise RuntimeError("Checkpoint restore requires an episode boundary.")
+            if not getattr(self.feature_model, "supports_replay_restore", True):
+                raise ValueError("This feature provider does not support actor/replay restore yet")
             self.learner.load_replay(resolve_sseval_replay_dir(path))
             self._activate_candidate_actor()
 
@@ -711,4 +733,8 @@ class SsEvalRLTRuntime:
             self._closed = True
             self._close_episode()
             self._seen_feedback.clear()
-            self.learner.close()
+            try:
+                self.learner.close()
+            finally:
+                if hasattr(self.feature_model, "close"):
+                    self.feature_model.close()
