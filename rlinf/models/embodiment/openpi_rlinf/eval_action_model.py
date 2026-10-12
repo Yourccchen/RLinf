@@ -178,20 +178,20 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
             "prompt": env_obs["task_descriptions"],
         }
         config_name = self.config_name.lower()
-        if "songling" in config_name:
+        if "songling" in config_name or "xingchen" in config_name:
             # Songling Stage 1 was trained with an overhead view plus both wrist
             # views. Do not silently fall back to masked zero wrist images here:
             # that would change the frozen feature distribution in Stage 2.
             wrist_images = env_obs.get("wrist_images", env_obs.get("extra_view_images"))
             if wrist_images is None:
                 raise KeyError(
-                    "Songling RLT observations require wrist_images (or "
+                    "Multi-view RLT observations require wrist_images (or "
                     "extra_view_images) containing left and right wrist views."
                 )
             wrist_shape = tuple(wrist_images.shape)
             if len(wrist_shape) != 5 or wrist_shape[1] != 2:
                 raise ValueError(
-                    "Songling wrist images must have shape [B, 2, H, W, C] "
+                    "RLT wrist images must have shape [B, 2, H, W, C] "
                     f"(left then right), got {wrist_shape}."
                 )
             processed_obs.update(
@@ -207,7 +207,7 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
             processed_obs["observation/state_gripper"] = env_states[:, 6:7]
         else:
             processed_obs["observation/state"] = env_states
-        if "songling" not in config_name:
+        if "songling" not in config_name and "xingchen" not in config_name:
             wrist_images = env_obs.get("wrist_images")
             if wrist_images is not None:
                 processed_obs["observation/wrist_image"] = wrist_images

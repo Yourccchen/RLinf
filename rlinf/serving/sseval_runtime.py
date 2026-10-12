@@ -255,18 +255,20 @@ class _PendingInference:
     actor_version: int
 
 
-def _single_observation(observation: Mapping[str, Any], instruction: str) -> dict:
+def _single_observation(
+    observation: Mapping[str, Any], instruction: str, action_dim: int = ACTION_DIM
+) -> dict:
     state = torch.as_tensor(observation["states"], dtype=torch.float32)
     main = torch.as_tensor(observation["main_images"])
     wrist = torch.as_tensor(observation["wrist_images"])
-    if state.shape == (14,):
+    if state.shape == (action_dim,):
         state = state.unsqueeze(0)
     if main.ndim == 3:
         main = main.unsqueeze(0)
     if wrist.ndim == 4:
         wrist = wrist.unsqueeze(0)
-    if state.shape != (1, 14):
-        raise ValueError(f"SsEval Songling state must be [1,14], got {state.shape}.")
+    if state.shape != (1, action_dim):
+        raise ValueError(f"SsEval state must be [1,{action_dim}], got {state.shape}.")
     if main.ndim != 4 or main.shape[0] != 1:
         raise ValueError(f"main_images must be [1,H,W,3], got {main.shape}.")
     if wrist.ndim != 5 or wrist.shape[:2] != (1, 2):
@@ -433,6 +435,7 @@ class SsEvalRLTRuntime:
         self.feature_model = feature_model.eval().requires_grad_(False)
         self.active_policy_model = active_policy_model.eval().requires_grad_(False)
         self.action_codec = action_codec
+        self.action_dim = int(action_codec.action_dim)
         self.learner = learner
         self.reference_seed = int(reference_seed)
         self.actor_rollout_sampling = bool(actor_rollout_sampling)
@@ -477,15 +480,35 @@ class SsEvalRLTRuntime:
         self._closed = False
 
     @classmethod
-    def from_config(cls, config_path: str | Path) -> "SsEvalRLTRuntime":
+    def from_config(
+        cls, config_path: str | Path, *, feature_model_adapter=None
+    ) -> "SsEvalRLTRuntime":
         cfg = OmegaConf.load(str(config_path))
         align_feature_model_from_sft_config(cfg, config_path)
         OmegaConf.resolve(cfg)
-        validate_rlt_stage2_configs(cfg.actor_model, cfg.feature_model)
+        feature_action_dim = None
+        if feature_model_adapter is not None:
+            feature_action_dim = feature_model_adapter.action_dim
+            if (
+                int(cfg.feature_model.action_dim)
+                != feature_model_adapter.model_action_dim
+            ):
+                raise ValueError(
+                    "Stage1 action layout does not match the feature adapter"
+                )
+        validate_rlt_stage2_configs(
+            cfg.actor_model,
+            cfg.feature_model,
+            feature_action_dim=feature_action_dim,
+        )
         device = torch.device(str(cfg.get("device", "cuda")))
         feature_model = get_model(copy.deepcopy(cfg.feature_model)).to(device).eval()
+        if feature_model_adapter is not None:
+            feature_model = feature_model_adapter(feature_model)
         active_model = get_model(copy.deepcopy(cfg.actor_model)).to(device).eval()
-        codec = SonglingActionCodec.from_config(cfg.action_codec)
+        codec = SonglingActionCodec.from_config(
+            cfg.action_codec, action_dim=int(cfg.actor_model.action_dim)
+        )
         learner_model = copy.deepcopy(active_model).train().requires_grad_(True)
         learner_cfg = InProcessLearnerConfig.from_mapping(
             OmegaConf.to_container(cfg.get("learner", {}), resolve=True)
@@ -572,7 +595,9 @@ class SsEvalRLTRuntime:
             self.learner.raise_if_failed()
             if self._episode_id is None:
                 raise RuntimeError("start_episode() must be called before inference.")
-            env_obs = _single_observation(observation, self._instruction)
+            env_obs = _single_observation(
+                observation, self._instruction, self.action_dim
+            )
             chunk_id = self._next_chunk_id
             seed = self.reference_seed + self._seed_index
             candidates, replay_obs = predict_rlt_candidates(
@@ -587,7 +612,7 @@ class SsEvalRLTRuntime:
                 reference_seed=seed,
                 actor_mode="train" if self.actor_rollout_sampling else "eval",
             )
-            actor_expected = songling_chunk_shape(self.chunk_len)
+            actor_expected = songling_chunk_shape(self.chunk_len, self.action_dim)
             if candidates.actor_action.shape != actor_expected:
                 raise ValueError(
                     f"RLT Actor candidate must be {actor_expected}, got "
@@ -595,15 +620,17 @@ class SsEvalRLTRuntime:
                 )
             if (
                 candidates.vla_action.ndim != 2
-                or candidates.vla_action.shape[1] != ACTION_DIM
+                or candidates.vla_action.shape[1] != self.action_dim
                 or candidates.vla_action.shape[0] < self.chunk_len
             ):
                 raise ValueError(
-                    "RLT VLA candidate must have shape (H, 14) with "
+                    f"RLT VLA candidate must have shape (H, {self.action_dim}) with "
                     f"H >= {self.chunk_len}, got {candidates.vla_action.shape}."
                 )
             feedback = (
-                TransitionFeedback.from_mapping(transition_feedback)
+                TransitionFeedback.from_mapping(
+                    transition_feedback, action_dim=self.action_dim
+                )
                 if transition_feedback is not None
                 else None
             )
@@ -643,7 +670,8 @@ class SsEvalRLTRuntime:
         if not observations:
             return {}
         singles = [
-            _single_observation(item, self._instruction) for item in observations
+            _single_observation(item, self._instruction, self.action_dim)
+            for item in observations
         ]
         env_obs = {
             "states": torch.cat([item["states"] for item in singles], dim=0),
@@ -769,10 +797,12 @@ class SsEvalRLTRuntime:
             if feedback.done:
                 self._resolve_episode_buffer(feedback)
             return True
-        if feedback.executed_actions.shape != songling_chunk_shape(self.chunk_len):
+        if feedback.executed_actions.shape != songling_chunk_shape(
+            self.chunk_len, self.action_dim
+        ):
             raise ValueError(
                 "Recorded RLT feedback must match the Actor execute horizon "
-                f"{songling_chunk_shape(self.chunk_len)}, got "
+                f"{songling_chunk_shape(self.chunk_len, self.action_dim)}, got "
                 f"{feedback.executed_actions.shape}."
             )
         if self.transition_stride < self.chunk_len:
@@ -850,7 +880,9 @@ class SsEvalRLTRuntime:
             self._require_open()
             if self._episode_id is None:
                 raise RuntimeError("No active SsEval RLT episode to end.")
-            feedback = TransitionFeedback.from_mapping(final_feedback)
+            feedback = TransitionFeedback.from_mapping(
+                final_feedback, action_dim=self.action_dim
+            )
             if not feedback.done:
                 raise ValueError("end_episode requires terminal or truncated feedback.")
             if feedback.key in self._seen_feedback:

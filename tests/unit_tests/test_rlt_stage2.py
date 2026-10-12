@@ -483,14 +483,18 @@ def test_songling_rlt_proprio_uses_normalized_stage1_state():
     assert torch.equal(proprio, normalized[:, :14])
 
 
-def test_songling_repack_preserves_all_three_camera_views():
+@pytest.mark.parametrize("config_name,dim", [
+    ("pi05_rlt_songling_joint", 14), ("pi05_rlt_xingchen_joint", 31),
+])
+def test_repack_preserves_all_three_camera_views(config_name, dim):
     wrapper = _songling_eval_wrapper()
+    wrapper.config_name = config_name
     main = torch.zeros(2, 32, 48, 3, dtype=torch.uint8)
     wrists = torch.stack([torch.ones_like(main), torch.full_like(main, 2)], dim=1)
 
     repacked = wrapper._repack_env_obs(
         {
-            "states": torch.zeros(2, 14),
+            "states": torch.zeros(2, dim),
             "main_images": main,
             "wrist_images": wrists,
             "task_descriptions": ["fold clothes", "fold clothes"],

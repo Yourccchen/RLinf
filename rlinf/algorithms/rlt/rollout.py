@@ -52,14 +52,18 @@ def validate_online_transition_stride(
         )
 
 
-def validate_rlt_stage2_configs(policy_cfg: Any, feature_cfg: Any) -> None:
+def validate_rlt_stage2_configs(
+    policy_cfg: Any, feature_cfg: Any, *, feature_action_dim: int | None = None
+) -> None:
     """Fail before loading Stage 1 when Stage 1/Stage 2 shapes disagree."""
     feature_openpi = _cfg_get(feature_cfg, "openpi", {})
     checks = (
         (
             "action_dim",
             int(_cfg_get(policy_cfg, "action_dim")),
-            int(_cfg_get(feature_cfg, "action_dim")),
+            int(_cfg_get(feature_cfg, "action_dim"))
+            if feature_action_dim is None
+            else int(feature_action_dim),
         ),
         (
             "RLT embedding dim",

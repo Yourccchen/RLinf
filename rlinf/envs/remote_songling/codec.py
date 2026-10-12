@@ -39,14 +39,21 @@ def decode_config_sequence(value: Any, field_name: str) -> list[Any]:
 
 
 class SonglingActionCodec:
-    """Map normalized Stage2 actions to physical absolute Songling qpos."""
+    """Affine Stage2 codec, defaulting to Songling's 14D physical qpos.
 
-    def __init__(self, action_low: Any, action_high: Any) -> None:
+    SsEval supplies action_dim=25 for Xingchen physical EEF. Rotation
+    representation and projection remain owned by the robot policy adapter.
+    """
+
+    def __init__(
+        self, action_low: Any, action_high: Any, *, action_dim: int = 14
+    ) -> None:
+        self.action_dim = int(action_dim)
         low = np.asarray(action_low, dtype=np.float32).reshape(-1)
         high = np.asarray(action_high, dtype=np.float32).reshape(-1)
-        if low.shape != (14,) or high.shape != (14,):
+        if low.shape != (self.action_dim,) or high.shape != (self.action_dim,):
             raise ValueError(
-                "Songling action limits must each contain 14 values, got "
+                f"Action limits must each contain {self.action_dim} values, got "
                 f"low={low.shape}, high={high.shape}."
             )
         if not np.isfinite(low).all() or not np.isfinite(high).all():
@@ -60,17 +67,19 @@ class SonglingActionCodec:
         self._bias = (high + low) / 2.0
 
     @classmethod
-    def from_config(cls, cfg: Any) -> "SonglingActionCodec":
+    def from_config(cls, cfg: Any, *, action_dim: int = 14) -> "SonglingActionCodec":
         return cls(
             decode_config_sequence(cfg.get("action_low"), "action_low"),
             decode_config_sequence(cfg.get("action_high"), "action_high"),
+            action_dim=action_dim,
         )
 
-    @staticmethod
-    def _validate_actions(actions: Any, name: str) -> None:
+    def _validate_actions(self, actions: Any, name: str) -> None:
         shape = tuple(actions.shape)
-        if not shape or shape[-1] != 14:
-            raise ValueError(f"{name} must have last dimension 14, got {shape}.")
+        if not shape or shape[-1] != self.action_dim:
+            raise ValueError(
+                f"{name} must have last dimension {self.action_dim}, got {shape}."
+            )
         finite = (
             torch.isfinite(actions).all()
             if torch.is_tensor(actions)
@@ -80,7 +89,7 @@ class SonglingActionCodec:
             raise ValueError(f"{name} must contain only finite values.")
 
     def encode(self, physical_actions: Any, *, clip: bool = False):
-        """Convert physical absolute qpos to the Actor/Critic [-1, 1] domain."""
+        """Convert physical absolute actions to the Actor/Critic [-1, 1] domain."""
         if torch.is_tensor(physical_actions):
             self._validate_actions(physical_actions, "physical_actions")
             low = torch.as_tensor(
@@ -97,7 +106,7 @@ class SonglingActionCodec:
         return np.clip(normalized, -1.0, 1.0) if clip else normalized
 
     def decode(self, normalized_actions: Any, *, clip: bool = True):
-        """Convert Actor/Critic actions to physical absolute qpos."""
+        """Convert Actor/Critic actions to physical absolute actions."""
         if torch.is_tensor(normalized_actions):
             self._validate_actions(normalized_actions, "normalized_actions")
             values = normalized_actions.clamp(-1.0, 1.0) if clip else normalized_actions
