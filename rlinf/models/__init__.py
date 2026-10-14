@@ -54,6 +54,14 @@ def register_model(
 
 
 def _register_builtin_models():
+    def _build_halo_wa(cfg, torch_dtype):
+        from rlinf.models.embodiment.halo_wa.policy import HaloWAPolicy
+        keys = ("visual_dim", "proprio_dim", "action_dim", "num_action_chunks",
+                "hidden_dim", "num_heads", "max_visual_tokens")
+        return HaloWAPolicy(**{k: int(cfg[k]) for k in keys if k in cfg}).to(dtype=torch_dtype)
+
+    register_model("halo_wa_policy", _build_halo_wa, category="embodied", force=True)
+
     def _build_openvla(cfg: DictConfig, torch_dtype):
         from rlinf.models.embodiment.openvla import get_model
 

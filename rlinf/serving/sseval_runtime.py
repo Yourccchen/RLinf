@@ -298,6 +298,7 @@ def _build_feedback_trajectory(
     next_obs: Mapping[str, torch.Tensor],
     feedback: TransitionFeedback,
     codec: SonglingActionCodec,
+    *, preserve_reference_actions: bool = False,
 ) -> Trajectory:
     normalized_actions = torch.as_tensor(
         codec.encode(feedback.executed_actions, clip=True), dtype=torch.float32
@@ -311,11 +312,12 @@ def _build_feedback_trajectory(
         (feedback.rlt_switch_flags & feedback.valid_step_mask).any()
     )
     curr = _unbatch_replay_obs(pending.replay_obs)
-    curr["ref_chunk"] = overwrite_rlt_ref_with_human(
-        curr["ref_chunk"].unsqueeze(0),
-        normalized_actions.reshape(1, -1),
-        intervene.unsqueeze(0),
-    ).squeeze(0)
+    if not preserve_reference_actions:
+        curr["ref_chunk"] = overwrite_rlt_ref_with_human(
+            curr["ref_chunk"].unsqueeze(0),
+            normalized_actions.reshape(1, -1),
+            intervene.unsqueeze(0),
+        ).squeeze(0)
     nxt = _unbatch_replay_obs(next_obs)
     return Trajectory(
         max_episode_length=1,
@@ -415,9 +417,27 @@ class SsEvalRLTRuntime:
             feature_model = feature_model.to(device).eval()
         active_model = get_model(copy.deepcopy(cfg.actor_model)).to(device).eval()
         learner_model = copy.deepcopy(active_model).train().requires_grad_(True)
-        learner_cfg = InProcessLearnerConfig.from_mapping(
-            OmegaConf.to_container(cfg.get("learner", {}), resolve=True)
-        )
+        learner_type = str(cfg.get("learner_type", "rlt_td3"))
+        learner_class = InProcessRLTTD3Learner
+        learner_kwargs = {}
+        raw_learner_cfg = OmegaConf.to_container(cfg.get("learner", {}), resolve=True)
+        if learner_type == "halo_wa":
+            from rlinf.serving.halo_wa_learner import HaloWALearner, HaloWALearnerConfig
+            if cfg.get("replay_checkpoint"):
+                raise ValueError("HALO-WA requires demo_checkpoint or a complete actor_checkpoint")
+            if str(cfg.actor_model.model_type) != "halo_wa_policy":
+                raise ValueError("HALO-WA learner requires halo_wa_policy")
+            learner_class = HaloWALearner
+            learner_cfg = HaloWALearnerConfig.from_mapping(raw_learner_cfg)
+            learner_kwargs["feature_identity"] = feature_model.rlt_checkpoint_version
+            if learner_cfg.training_stage == "online" and not (cfg.get("demo_checkpoint") or cfg.get("actor_checkpoint")):
+                raise ValueError("HALO-WA online training requires a demo_checkpoint or complete resume")
+        elif learner_type == "rlt_td3":
+            if str(cfg.actor_model.model_type) == "halo_wa_policy":
+                raise ValueError("halo_wa_policy requires learner_type=halo_wa")
+            learner_cfg = InProcessLearnerConfig.from_mapping(raw_learner_cfg)
+        else:
+            raise ValueError(f"Unknown learner_type: {learner_type}")
         save_interval = int(cfg.get("save_interval", 0) or 0)
         save_dir = cfg.get("save_dir", None)
         if save_interval > 0:
@@ -427,12 +447,22 @@ class SsEvalRLTRuntime:
             if not save_path.is_absolute():
                 save_path = _repo_root_from_runtime(Path(config_path)) / save_path
             save_dir = save_path.resolve()
-        learner = InProcessRLTTD3Learner(
+        learner = learner_class(
             learner_model,
-            learner_cfg,
+            learner_cfg if learner_type == "rlt_td3" else raw_learner_cfg,
+            **learner_kwargs,
             save_interval=save_interval,
             save_dir=save_dir,
         )
+        if learner_type == "halo_wa" and cfg.get("demo_checkpoint"):
+            try:
+                demo_path = Path(str(cfg.demo_checkpoint)).expanduser()
+                if not demo_path.is_absolute():
+                    demo_path = _repo_root_from_runtime(Path(config_path)) / demo_path
+                learner.load_demo_checkpoint(demo_path)
+            except BaseException:
+                learner.close()
+                raise
         runtime = cls(
             feature_model=feature_model,
             active_policy_model=active_model,
@@ -441,7 +471,11 @@ class SsEvalRLTRuntime:
             reference_seed=int(cfg.get("reference_seed", 2026)),
             chunk_len=int(cfg.actor_model.num_action_chunks),
         )
-        apply_sseval_restore(runtime, cfg, config_path)
+        try:
+            apply_sseval_restore(runtime, cfg, config_path)
+        except BaseException:
+            runtime.close()
+            raise
         return runtime
 
     @property
@@ -575,7 +609,8 @@ class SsEvalRLTRuntime:
                 f"{feedback.executed_actions.shape}."
             )
         trajectory = _build_feedback_trajectory(
-            pending, next_obs, feedback, self.action_codec
+            pending, next_obs, feedback, self.action_codec,
+            preserve_reference_actions=bool(getattr(self.feature_model, "preserve_reference_actions", False)),
         )
         if bool(
             trajectory.forward_inputs["record_transition"]
