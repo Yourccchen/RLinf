@@ -50,6 +50,7 @@ _OPTIONAL_ARIO_CONFIG_DEFAULTS = {
     "index_cache_dir": "",
     "discover_from_data_lake": False,
     "index_workers": 32,
+    "excluded_episodes": (),
 }
 
 
@@ -251,7 +252,8 @@ def build_xingchen_sft_dataloader(
     max_episodes = OmegaConf.select(data_cfg, "max_episodes", default=None)
     cache_size: int = int(OmegaConf.select(data_cfg, "cache_size", default=32))
     # "songling_canonical55" pulls the 14-D qpos/gripper vector out of
-    # state.pt's __canonical55__; "xingchen" expects the older split .pt files.
+    # state.pt's __canonical55__; "xingchen" expects older split .pt files,
+    # while "xingchen_state" reads semantic pose fields from unified state.pt.
     data_format: str = str(
         OmegaConf.select(data_cfg, "data_format", default="songling_canonical55")
     )
@@ -300,12 +302,19 @@ def build_xingchen_sft_dataloader(
     seed: int = int(OmegaConf.select(cfg.actor, "seed", default=0))
 
     # Build the ARIO streaming dataset
-    from openpi.datasets.ario_dataset import ArioConfig, ArioStreamingDataset
+    from openpi.datasets.ario_dataset import ArioConfig
+
+    from rlinf.data.datasets.openpi_rlinf.xingchen.ario_state_dataset import (
+        create_ario_dataset,
+    )
 
     ario_cfg = _create_ario_config(
         ArioConfig,
         {
             "s3_prefixes": s3_prefixes,
+            "excluded_episodes": tuple(
+                OmegaConf.select(data_cfg, "excluded_episodes", default=[])
+            ),
             "s3_endpoint": s3_endpoint,
             "video_downsample_rate": video_downsample_rate,
             "min_frames": min_frames,
@@ -341,7 +350,7 @@ def build_xingchen_sft_dataloader(
         action_horizon=action_horizon,
     )
 
-    ario_dataset = ArioStreamingDataset(config=ario_cfg, action_horizon=action_horizon)
+    ario_dataset = create_ario_dataset(ario_cfg, action_horizon)
     transformed = _TransformedArioDataset(ario_dataset, compose(input_transforms))
 
     mp_context = multiprocessing.get_context("spawn") if num_workers > 0 else None

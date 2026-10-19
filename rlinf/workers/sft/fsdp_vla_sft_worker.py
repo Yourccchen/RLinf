@@ -15,11 +15,12 @@ import os
 from typing import Any
 
 import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from rlinf.config import SupportedModel
 from rlinf.models.embodiment.base_policy import ForwardType
+from rlinf.utils.checkpoint import save_normalization_assets
 from rlinf.utils.utils import get_rng_state, set_rng_state
 from rlinf.workers.sft.fsdp_sft_worker import FSDPSftWorker
 
@@ -108,6 +109,18 @@ class FSDPVlaSftWorker(FSDPSftWorker):
 
     def save_checkpoint(self, save_path: str, step: int = 0) -> None:
         super().save_checkpoint(save_path, step)
+
+        norm_stats_path = OmegaConf.select(
+            self.cfg.actor.model, "openpi_data.norm_stats_path", default=None
+        )
+        if self._rank == 0 and norm_stats_path is not None:
+            save_normalization_assets(
+                norm_stats_path,
+                save_path,
+                asset_id=OmegaConf.select(
+                    self.cfg.actor.model, "openpi_data.repo_id", default=None
+                ),
+            )
 
         if isinstance(self.data_loader, StatefulDataLoader):
             state = self.data_loader.state_dict()
