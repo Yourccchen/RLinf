@@ -18,12 +18,14 @@ ACTION_DIM = 14
 CHUNK_LEN = 50
 
 
-def songling_chunk_shape(chunk_len: int) -> tuple[int, int]:
-    """Return the Songling ``(C, action_dim)`` chunk shape for ``chunk_len``."""
+def songling_chunk_shape(
+    chunk_len: int, action_dim: int = ACTION_DIM
+) -> tuple[int, int]:
+    """Return the configured chunk shape, defaulting to 14D Songling."""
     horizon = int(chunk_len)
     if horizon < 1:
         raise ValueError(f"chunk_len must be positive, got {horizon}.")
-    return horizon, ACTION_DIM
+    return horizon, action_dim
 
 
 class SelectedMode(str, Enum):
@@ -62,14 +64,13 @@ class DualActionCandidates:
         object.__setattr__(self, "chunk_id", int(self.chunk_id))
         vla = _array(self.vla_action, name="vla_action", dtype=np.float32, ndim=2)
         actor = _array(self.actor_action, name="actor_action", dtype=np.float32, ndim=2)
-        if vla.shape[0] < 1 or vla.shape[1] != ACTION_DIM:
+        if vla.shape[0] < 1 or vla.shape[1] not in {14, 25}:
             raise ValueError(
-                f"vla_action must have shape (C, {ACTION_DIM}) with C>=1, "
-                f"got {vla.shape}."
+                f"vla_action must have shape (C, 14 or 25) with C>=1, got {vla.shape}."
             )
-        if actor.shape[0] < 1 or actor.shape[1] != ACTION_DIM:
+        if actor.shape[0] < 1 or actor.shape[1] != vla.shape[1]:
             raise ValueError(
-                f"actor_action must have shape (C, {ACTION_DIM}) with C>=1, "
+                "actor_action must match the VLA dimension with C>=1, "
                 f"got {actor.shape}."
             )
         if vla.shape[0] < actor.shape[0]:
@@ -115,10 +116,15 @@ class TransitionFeedback:
     rlt_switch_flags: np.ndarray
     actor_version: int
     timestamps: Mapping[str, Any]
+    intermediate_observations: tuple[Mapping[str, Any], ...]
 
     @classmethod
     def from_mapping(
-        cls, payload: Mapping[str, Any], *, chunk_len: int | None = None
+        cls,
+        payload: Mapping[str, Any],
+        *,
+        chunk_len: int | None = None,
+        action_dim: int = ACTION_DIM,
     ) -> "TransitionFeedback":
         version = payload.get("rlt_protocol_version")
         if version != RLT_SSEVAL_PROTOCOL_VERSION:
@@ -137,12 +143,11 @@ class TransitionFeedback:
             ndim=2,
         )
         expected = songling_chunk_shape(
-            int(actions.shape[0] if chunk_len is None else chunk_len)
+            int(actions.shape[0] if chunk_len is None else chunk_len), action_dim
         )
         if actions.shape != expected:
             raise ValueError(
-                "executed_actions must be padded to "
-                f"{expected}, got {actions.shape}."
+                f"executed_actions must be padded to {expected}, got {actions.shape}."
             )
 
         def vector(name: str, dtype: Any) -> np.ndarray:
@@ -167,6 +172,23 @@ class TransitionFeedback:
             )
         if mode is not SelectedMode.HUMAN and intervene[valid].any():
             raise ValueError("Only human-mode steps may set intervene_flags=True.")
+        intermediate = []
+        seen_indices = set()
+        for item in payload.get("intermediate_observations") or []:
+            if not isinstance(item, Mapping):
+                raise ValueError("intermediate_observations entries must be mappings.")
+            step_index = int(item.get("step_index", -1))
+            if (
+                step_index <= 0
+                or step_index >= expected[0]
+                or step_index in seen_indices
+            ):
+                raise ValueError(
+                    "intermediate observation step_index must be unique and within "
+                    f"(0, {expected[0]}), got {step_index}."
+                )
+            seen_indices.add(step_index)
+            intermediate.append(dict(item))
         return cls(
             episode_id=episode_id,
             chunk_id=int(payload.get("chunk_id")),
@@ -180,6 +202,7 @@ class TransitionFeedback:
             rlt_switch_flags=rlt_switch,
             actor_version=int(payload.get("actor_version", 0)),
             timestamps=dict(payload.get("timestamps") or {}),
+            intermediate_observations=tuple(intermediate),
         )
 
     @property
