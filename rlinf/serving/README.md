@@ -96,3 +96,10 @@ failed receipt remains incomplete; it cannot authorize an ARIO export. Receipt
 IO failures are logged separately and do not undo replay insertion. Robot-side
 export unions accepted execution slots, removes overlap and excludes inference
 waits. This change does not modify the SFT loader or launch training.
+
+Receipt updates are coalesced on a bounded background writer queue. Replay
+insertion does not wait for filesystem writes. Status queries wait for queued
+writes and read the persisted receipt outside the policy receive loop; queue
+saturation or persistence errors keep the receipt incomplete. Runtime shutdown
+drains learner callbacks before closing the receipt writer. This isolation does
+not provide a deadline for shutdown when storage is stalled.

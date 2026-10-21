@@ -1220,6 +1220,7 @@ def test_ario_receipt_waits_for_actual_insertion_and_survives_reset(tmp_path):
     runtime.enable_ario_recording("run-2")
     assert not runtime.ario_status("episode-1", "run-2")["complete"]
     assert runtime.ario_status("episode-1", "run-1")["complete"]
+    runtime.close()
 
 
 def test_learner_receipt_observer_failure_does_not_change_replay():
@@ -1239,8 +1240,11 @@ def test_ario_strided_receipts_map_overlapping_windows_to_execution_steps(tmp_pa
     class Features(FakeFeatureModel):
         def extract_rlt_obs(self, env_obs, rng=None):
             batch = env_obs["states"].shape[0]
-            return {"z_rl": torch.zeros(batch, 8), "proprio": env_obs["states"],
-                    "ref_chunk": torch.zeros(batch, 4, 25)}
+            return {
+                "z_rl": torch.zeros(batch, 8),
+                "proprio": env_obs["states"],
+                "ref_chunk": torch.zeros(batch, 4, 25),
+            }
 
     learner = FakeLearner()
     learner.save_dir = tmp_path
@@ -1249,10 +1253,15 @@ def test_ario_strided_receipts_map_overlapping_windows_to_execution_steps(tmp_pa
     runtime = SsEvalRLTRuntime(
         feature_model=Features(),
         active_policy_model=RLTTD3MLPPolicy(
-            z_dim=8, proprio_dim=25, action_dim=25, num_action_chunks=4,
+            z_dim=8,
+            proprio_dim=25,
+            action_dim=25,
+            num_action_chunks=4,
         ),
-        action_codec=SonglingActionCodec([-1.] * 25, [1.] * 25, action_dim=25),
-        learner=learner, chunk_len=4, transition_stride=2,
+        action_codec=SonglingActionCodec([-1.0] * 25, [1.0] * 25, action_dim=25),
+        learner=learner,
+        chunk_len=4,
+        transition_stride=2,
     )
     observation = dict(_observation(), states=np.zeros(25, dtype=np.float32))
     runtime.start_episode("episode-1", "build")
@@ -1274,3 +1283,66 @@ def test_ario_strided_receipts_map_overlapping_windows_to_execution_steps(tmp_pa
     assert receipt["transitions"][1]["steps"] == [[0, 2], [0, 3], [1, 0], [1, 1]]
     union = {tuple(step) for item in receipt["transitions"] for step in item["steps"]}
     assert union == {(chunk, step) for chunk in range(2) for step in range(4)}
+    runtime.close()
+
+
+def test_replay_receipts_slow_disk_does_not_block_acceptance(tmp_path, monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from rlinf.serving.replay_receipts import ReplayReceipts
+
+    entered, release = threading.Event(), threading.Event()
+    original = Path.write_text
+
+    def slow_write(path, *args, **kwargs):
+        if path.parent == tmp_path:
+            entered.set()
+            assert release.wait(3)
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", slow_write)
+    store = ReplayReceipts(tmp_path)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            start = executor.submit(store.start, "run:episode", "build", 20, "episode")
+            assert entered.wait(1)
+            try:
+                start.result(timeout=0.2)
+                store.expect(
+                    "run:episode",
+                    [{"weights_id": "w", "accepted": False, "steps": [[0, 0]]}],
+                )
+                executor.submit(store.accept, "run:episode", "w").result(timeout=0.2)
+                store.finish("run:episode")
+            finally:
+                release.set()
+        assert store.status("run:episode")["complete"]
+    finally:
+        release.set()
+        store.close()
+    recovered = ReplayReceipts(tmp_path)
+    assert recovered.status("run:episode")["complete"]
+    recovered.close()
+
+
+def test_replay_receipt_disk_failure_never_authorizes_export(tmp_path, monkeypatch):
+    from rlinf.serving.replay_receipts import ReplayReceipts
+
+    def disk_full(*args, **kwargs):
+        raise OSError(28, "Injected disk full")
+
+    monkeypatch.setattr(Path, "write_text", disk_full)
+    store = ReplayReceipts(tmp_path)
+    try:
+        store.start("run:episode", "build", 20, "episode")
+        store.expect(
+            "run:episode", [{"weights_id": "w", "accepted": False, "steps": [[0, 0]]}]
+        )
+        store.accept("run:episode", "w")
+        store.finish("run:episode")
+        result = store.status("run:episode")
+        assert not result["complete"]
+        assert "disk full" in result["error"]
+    finally:
+        store.close()

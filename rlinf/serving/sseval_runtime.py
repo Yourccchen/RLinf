@@ -1215,5 +1215,9 @@ class SsEvalRLTRuntime:
             try:
                 self.learner.close()
             finally:
-                if hasattr(self.feature_model, "close"):
-                    self.feature_model.close()
+                try:
+                    if self._ario_receipts is not None:
+                        self._ario_receipts.close()
+                finally:
+                    if hasattr(self.feature_model, "close"):
+                        self.feature_model.close()
