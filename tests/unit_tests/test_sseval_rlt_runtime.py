@@ -1196,3 +1196,81 @@ def test_external_feature_provider_preserves_observation_and_lifecycle(tmp_path)
         runtime.close()
         runtime.close()
     assert provider.events == ["validate", "episode-soma", "prepare", "reset", "close"]
+
+
+def test_ario_receipt_waits_for_actual_insertion_and_survives_reset(tmp_path):
+    runtime, _ = _runtime()
+    runtime.learner.save_dir = tmp_path
+    callbacks = {}
+    runtime.learner.observe_replay = lambda key, callback: callbacks.setdefault(
+        key, callback
+    )
+    runtime.start_episode("episode-1", "build blocks")
+    runtime.enable_ario_recording("run-1")
+    runtime.infer_candidates(_observation())
+    runtime.end_episode(_feedback(0, done=True))
+    assert not runtime.ario_status("episode-1", "run-1")["complete"]
+    assert len(callbacks) == len(runtime.learner.submitted) == 1
+    next(iter(callbacks.values()))()
+    runtime.reset()
+    status = runtime.ario_status("episode-1", "run-1")
+    assert status["complete"]
+    assert status["transitions"][0]["steps"] == [[0, i] for i in range(CHUNK_LEN)]
+    runtime.start_episode("episode-1", "build blocks")
+    runtime.enable_ario_recording("run-2")
+    assert not runtime.ario_status("episode-1", "run-2")["complete"]
+    assert runtime.ario_status("episode-1", "run-1")["complete"]
+
+
+def test_learner_receipt_observer_failure_does_not_change_replay():
+    learner = _td3_learner()
+    trajectory = _offline_rlt_trajectory()
+
+    def fail():
+        raise OSError("receipt disk full")
+
+    learner.observe_replay(trajectory.model_weights_id, fail)
+    learner.add_and_train(trajectory)
+    assert learner.replay.total_samples > 0
+    learner.close()
+
+
+def test_ario_strided_receipts_map_overlapping_windows_to_execution_steps(tmp_path):
+    class Features(FakeFeatureModel):
+        def extract_rlt_obs(self, env_obs, rng=None):
+            batch = env_obs["states"].shape[0]
+            return {"z_rl": torch.zeros(batch, 8), "proprio": env_obs["states"],
+                    "ref_chunk": torch.zeros(batch, 4, 25)}
+
+    learner = FakeLearner()
+    learner.save_dir = tmp_path
+    callbacks = []
+    learner.observe_replay = lambda key, callback: callbacks.append(callback)
+    runtime = SsEvalRLTRuntime(
+        feature_model=Features(),
+        active_policy_model=RLTTD3MLPPolicy(
+            z_dim=8, proprio_dim=25, action_dim=25, num_action_chunks=4,
+        ),
+        action_codec=SonglingActionCodec([-1.] * 25, [1.] * 25, action_dim=25),
+        learner=learner, chunk_len=4, transition_stride=2,
+    )
+    observation = dict(_observation(), states=np.zeros(25, dtype=np.float32))
+    runtime.start_episode("episode-1", "build")
+    runtime.enable_ario_recording("run")
+    runtime.infer_candidates(observation)
+    for chunk in range(2):
+        feedback = _feedback(chunk, chunk_len=4, done=chunk == 1)
+        feedback["executed_actions"] = np.zeros((4, 25), dtype=np.float32)
+        feedback["intermediate_observations"] = [dict(observation, step_index=2)]
+        if chunk == 0:
+            runtime.infer_candidates(observation, feedback)
+        else:
+            runtime.end_episode(feedback)
+    assert len(learner.submitted) == len(callbacks) == 3
+    for callback in callbacks:
+        callback()
+    receipt = runtime.ario_status("episode-1", "run")
+    assert receipt["complete"]
+    assert receipt["transitions"][1]["steps"] == [[0, 2], [0, 3], [1, 0], [1, 1]]
+    union = {tuple(step) for item in receipt["transitions"] for step in item["steps"]}
+    assert union == {(chunk, step) for chunk in range(2) for step in range(4)}

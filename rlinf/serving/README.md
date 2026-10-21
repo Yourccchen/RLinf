@@ -74,3 +74,24 @@ tests without starting PolicyServer:
 cd /home/fanyiming/RealWorldInference-fym
 python -m pytest -q tests/test_rlinf_policy.py
 ```
+
+## Optional robot-local ARIO export
+
+RealWorldInference can preserve the raw Songling observations for accepted replay
+transitions using its robot-side `recording.save_ario` option. Raw images and
+states stay on the robot; RLinf only keeps small acceptance receipts under the
+existing learner run directory's `ario_receipts/`. Existing configuration,
+trajectory serialization, training and checkpoint behavior remain unchanged.
+
+The optional `ario_run_id` observation metadata enables receipts for the active
+session. Window-to-execution-step mappings are recorded alongside trajectories,
+not inside them. Acceptance is marked only after `replay.add_trajectories`
+succeeds. A complete receipt requires the episode's original outcome decision
+and all selected insertions. An aborted episode has no accepted windows.
+
+The policy adapter exposes `ario_status(episode_id, run_id)` for the SEP backend
+relay. Queries survive episode reset and read persisted receipts. A missing or
+failed receipt remains incomplete; it cannot authorize an ARIO export. Receipt
+IO failures are logged separately and do not undo replay insertion. Robot-side
+export unions accepted execution slots, removes overlap and excludes inference
+waits. This change does not modify the SFT loader or launch training.

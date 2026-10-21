@@ -8,8 +8,9 @@ import copy
 import queue
 import threading
 import time
-from pathlib import Path
+from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping
 
 import torch
@@ -224,6 +225,7 @@ class InProcessRLTTD3Learner:
         )
         self.update_step = 0
         self.total_transitions = 0
+        self._replay_observers: dict[str, Callable[[], None]] = {}
         self._queue: queue.Queue[Trajectory | None] = queue.Queue(
             maxsize=self.config.queue_size
         )
@@ -265,6 +267,10 @@ class InProcessRLTTD3Learner:
                 "SsEval RLT learner queue is full; refusing to drop transition."
             ) from exc
 
+    def observe_replay(self, weights_id: str, callback: Callable[[], None]) -> None:
+        """Notify an optional recorder after insertion, without altering replay."""
+        self._replay_observers[weights_id] = callback
+
     def _run(self) -> None:
         while True:
             trajectory = self._queue.get()
@@ -282,6 +288,12 @@ class InProcessRLTTD3Learner:
         with self._train_lock:
             self._write_human_actions_into_ref(trajectory)
             self.replay.add_trajectories([trajectory])
+            observer = self._replay_observers.pop(trajectory.model_weights_id, None)
+            if observer is not None:
+                try:
+                    observer()
+                except Exception:
+                    logger.exception("ARIO receipt failed; replay remains accepted")
             self.total_transitions += int(trajectory.rewards.shape[0])
             if self.replay.total_samples < self.config.min_buffer_size:
                 return
