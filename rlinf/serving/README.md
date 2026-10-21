@@ -78,7 +78,8 @@ python -m pytest -q tests/test_rlinf_policy.py
 ## Optional robot-local ARIO export
 
 RealWorldInference can preserve the raw Songling observations for accepted replay
-transitions using its robot-side `recording.save_ario` option. Raw images and
+transitions using `policy.recording.save_ario` in its policy YAML. Both the
+recording switch and robot-local output path are forwarded at session start. Raw images and
 states stay on the robot; RLinf only keeps small acceptance receipts under the
 existing learner run directory's `ario_receipts/`. Existing configuration,
 trajectory serialization, training and checkpoint behavior remain unchanged.
