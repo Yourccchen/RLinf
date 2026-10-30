@@ -31,7 +31,7 @@ class ReplayReceipts:
         return self.root / f"{name}.json"
 
     def start(
-        self, episode_id: str, instruction: str, stride: int, source_episode: str
+        self, episode_id: str, instruction: str, source_episode: str
     ) -> None:
         with self._lock:
             if episode_id in self._episodes:
@@ -39,7 +39,6 @@ class ReplayReceipts:
             self._episodes[episode_id] = {
                 "episode_id": source_episode,
                 "instruction": instruction,
-                "stride": stride,
                 "finalized": False,
                 "transitions": [],
             }

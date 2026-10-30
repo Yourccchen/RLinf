@@ -474,8 +474,6 @@ class SsEvalRLTRuntime:
             )
         self._ario_receipts = None
         self._ario_key = None
-        self._ario_ranges = {}
-        self._ario_stride_steps = []
         self._stride_chunk_starts = {}
         self._stride_windows = []
         self._seed_index = 0
@@ -643,7 +641,6 @@ class SsEvalRLTRuntime:
             self._ario_receipts.start(
                 self._ario_key,
                 self._instruction,
-                self.transition_stride,
                 self._episode_id,
             )
 
@@ -837,10 +834,6 @@ class SsEvalRLTRuntime:
         feedback: TransitionFeedback,
     ) -> None:
         base_step = len(self._stride_actions)
-        if self._ario_recording():
-            self._ario_stride_steps.extend(
-                [feedback.chunk_id, offset] for offset in range(self.chunk_len)
-            )
         self._stride_chunk_starts[feedback.key] = base_step
         self._stride_features[base_step] = _unbatch_replay_obs(pending.replay_obs)
         for offset, feature in self._extract_intermediate_features(feedback).items():
@@ -910,15 +903,6 @@ class SsEvalRLTRuntime:
                 )
             )
             self._stride_windows.append((start, self._episode_buffer[-1]))
-            if self._ario_recording():
-                trajectory = self._episode_buffer[-1]
-                self._ario_ranges[trajectory.model_weights_id] = [
-                    step
-                    for step, keep in zip(
-                        self._ario_stride_steps[start:stop], valid.tolist()
-                    )
-                    if keep
-                ]
 
     def _ingest_feedback(
         self, feedback: TransitionFeedback, next_obs: Mapping[str, torch.Tensor]
@@ -970,12 +954,6 @@ class SsEvalRLTRuntime:
                 .all()
             ):
                 self._episode_buffer.append(trajectory)
-                if self._ario_recording():
-                    self._ario_ranges[trajectory.model_weights_id] = [
-                        [feedback.chunk_id, index]
-                        for index, keep in enumerate(feedback.valid_step_mask)
-                        if keep
-                    ]
         self._seen_feedback.add(feedback.key)
         if feedback.done:
             self._resolve_episode_buffer(feedback)
@@ -990,7 +968,6 @@ class SsEvalRLTRuntime:
                 [
                     {
                         "weights_id": item.model_weights_id,
-                        "steps": self._ario_ranges[item.model_weights_id],
                         "accepted": False,
                     }
                     for item in trajectories
@@ -1079,7 +1056,6 @@ class SsEvalRLTRuntime:
 
     def _close_episode(self) -> None:
         self._ario_key = None
-        self._ario_ranges.clear()
         self._episode_id = None
         self._instruction = ""
         self._pending = None
@@ -1087,7 +1063,6 @@ class SsEvalRLTRuntime:
         self._reset_stride_buffers()
 
     def _reset_stride_buffers(self) -> None:
-        self._ario_stride_steps.clear()
         self._stride_actions.clear()
         self._stride_rewards.clear()
         self._stride_terminated.clear()

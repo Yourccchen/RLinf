@@ -1423,12 +1423,54 @@ def test_ario_receipt_waits_for_actual_insertion_and_survives_reset(tmp_path):
     runtime.reset()
     status = runtime.ario_status("episode-1", "run-1")
     assert status["complete"]
-    assert status["transitions"][0]["steps"] == [[0, i] for i in range(CHUNK_LEN)]
+    assert status["transitions"] == [
+        {"weights_id": runtime.learner.submitted[0].model_weights_id, "accepted": True}
+    ]
     runtime.start_episode("episode-1", "build blocks")
     runtime.enable_ario_recording("run-2")
     assert not runtime.ario_status("episode-1", "run-2")["complete"]
     assert runtime.ario_status("episode-1", "run-1")["complete"]
     runtime.close()
+
+
+@pytest.mark.parametrize(
+    "outcome,critical_phase,accepted",
+    [
+        ("success", True, True),
+        ("failure", True, True),
+        ("abort", True, False),
+        ("success", False, False),
+    ],
+)
+def test_ario_episode_requires_labeled_outcome_and_replay_insertion(
+    tmp_path, outcome, critical_phase, accepted
+):
+    runtime, _ = _runtime()
+    runtime.learner.save_dir = tmp_path
+    callbacks = []
+    runtime.learner.observe_replay = lambda key, callback: callbacks.append(callback)
+    try:
+        runtime.start_episode("episode-1", "build blocks")
+        runtime.enable_ario_recording("run")
+        runtime.infer_candidates(_observation())
+        runtime.end_episode(
+            _feedback(
+                done=outcome != "abort",
+                truncated=outcome == "abort",
+                reward=float(outcome == "success"),
+                critical_phase=critical_phase,
+            )
+        )
+        assert len(runtime.learner.submitted) == int(accepted)
+        if accepted:
+            assert not runtime.ario_status("episode-1", "run")["complete"]
+        for callback in callbacks:
+            callback()
+        status = runtime.ario_status("episode-1", "run")
+        assert status["complete"]
+        assert bool(status["transitions"]) == accepted
+    finally:
+        runtime.close()
 
 
 def test_learner_receipt_observer_failure_does_not_change_replay():
@@ -1444,7 +1486,7 @@ def test_learner_receipt_observer_failure_does_not_change_replay():
     learner.close()
 
 
-def test_ario_strided_receipts_map_overlapping_windows_to_execution_steps(tmp_path):
+def test_ario_episode_waits_for_all_replay_insertions(tmp_path):
     class Features(FakeFeatureModel):
         def extract_rlt_obs(self, env_obs, rng=None):
             batch = env_obs["states"].shape[0]
@@ -1484,13 +1526,16 @@ def test_ario_strided_receipts_map_overlapping_windows_to_execution_steps(tmp_pa
         else:
             runtime.end_episode(feedback)
     assert len(learner.submitted) == len(callbacks) == 3
-    for callback in callbacks:
+    callbacks[0]()
+    assert not runtime.ario_status("episode-1", "run")["complete"]
+    for callback in callbacks[1:]:
         callback()
     receipt = runtime.ario_status("episode-1", "run")
     assert receipt["complete"]
-    assert receipt["transitions"][1]["steps"] == [[0, 2], [0, 3], [1, 0], [1, 1]]
-    union = {tuple(step) for item in receipt["transitions"] for step in item["steps"]}
-    assert union == {(chunk, step) for chunk in range(2) for step in range(4)}
+    assert receipt["transitions"] == [
+        {"weights_id": item.model_weights_id, "accepted": True}
+        for item in learner.submitted
+    ]
     runtime.close()
 
 
@@ -1513,13 +1558,13 @@ def test_replay_receipts_slow_disk_does_not_block_acceptance(tmp_path, monkeypat
     store = ReplayReceipts(tmp_path)
     try:
         with ThreadPoolExecutor(max_workers=1) as executor:
-            start = executor.submit(store.start, "run:episode", "build", 20, "episode")
+            start = executor.submit(store.start, "run:episode", "build", "episode")
             assert entered.wait(1)
             try:
                 start.result(timeout=0.2)
                 store.expect(
                     "run:episode",
-                    [{"weights_id": "w", "accepted": False, "steps": [[0, 0]]}],
+                    [{"weights_id": "w", "accepted": False}],
                 )
                 executor.submit(store.accept, "run:episode", "w").result(timeout=0.2)
                 store.finish("run:episode")
@@ -1543,9 +1588,9 @@ def test_replay_receipt_disk_failure_never_authorizes_export(tmp_path, monkeypat
     monkeypatch.setattr(Path, "write_text", disk_full)
     store = ReplayReceipts(tmp_path)
     try:
-        store.start("run:episode", "build", 20, "episode")
+        store.start("run:episode", "build", "episode")
         store.expect(
-            "run:episode", [{"weights_id": "w", "accepted": False, "steps": [[0, 0]]}]
+            "run:episode", [{"weights_id": "w", "accepted": False}]
         )
         store.accept("run:episode", "w")
         store.finish("run:episode")
