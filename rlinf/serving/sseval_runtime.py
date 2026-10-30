@@ -437,6 +437,7 @@ class SsEvalRLTRuntime:
         learner: InProcessRLTTD3Learner,
         reference_seed: int = 2026,
         chunk_len: int | None = None,
+        actor_rollout_sampling: bool = False,
         transition_stride: int | None = None,
     ) -> None:
         self.feature_model = feature_model.eval().requires_grad_(False)
@@ -445,6 +446,7 @@ class SsEvalRLTRuntime:
         self.action_dim = action_codec.action_dim
         self.learner = learner
         self.reference_seed = int(reference_seed)
+        self.actor_rollout_sampling = bool(actor_rollout_sampling)
         model_chunk_len = int(
             getattr(active_policy_model, "chunk_len", 0)
             or getattr(active_policy_model, "num_action_chunks", 0)
@@ -464,35 +466,35 @@ class SsEvalRLTRuntime:
             raise ValueError(
                 "transition_stride must be a positive divisor of chunk_len"
             )
-        if self.transition_stride < resolved and (
-            self.action_dim != 25 or hasattr(feature_model, "prepare_observation")
+        if self.transition_stride < resolved and hasattr(
+            feature_model, "prepare_observation"
         ):
             raise ValueError(
-                "Online stride replay requires Xingchen OpenPI intermediate observations"
+                "Online stride replay requires OpenPI intermediate observations"
             )
         self._ario_receipts = None
         self._ario_key = None
         self._ario_ranges = {}
         self._ario_stride_steps = []
-        self._stride_actions = []
-        self._stride_rewards = []
-        self._stride_terminated = []
-        self._stride_truncated = []
-        self._stride_valid = []
-        self._stride_intervene = []
-        self._stride_switch = []
-        self._stride_modes = []
-        self._stride_versions = []
-        self._stride_features = {}
         self._stride_chunk_starts = {}
         self._stride_windows = []
-        self._next_stride_start = 0
         self._seed_index = 0
         self._episode_id: str | None = None
         self._instruction = ""
         self._next_chunk_id = 0
         self._pending: _PendingInference | None = None
         self._episode_buffer: list[Trajectory] = []
+        self._stride_actions: list[torch.Tensor] = []
+        self._stride_rewards: list[torch.Tensor] = []
+        self._stride_terminated: list[torch.Tensor] = []
+        self._stride_truncated: list[torch.Tensor] = []
+        self._stride_valid: list[torch.Tensor] = []
+        self._stride_intervene: list[torch.Tensor] = []
+        self._stride_switch: list[torch.Tensor] = []
+        self._stride_modes: list[str] = []
+        self._stride_versions: list[int] = []
+        self._stride_features: dict[int, dict[str, torch.Tensor]] = {}
+        self._next_stride_start = 0
         self._seen_feedback: set[tuple[str, int]] = set()
         self._active_actor_version = 0
         self._episode_actor_ready = False
@@ -614,9 +616,8 @@ class SsEvalRLTRuntime:
             learner=learner,
             reference_seed=int(cfg.get("reference_seed", 2026)),
             chunk_len=int(cfg.actor_model.num_action_chunks),
-            transition_stride=cfg.get("transition_stride")
-            if embodiment == "xingchen"
-            else None,
+            actor_rollout_sampling=bool(cfg.get("actor_rollout_sampling", False)),
+            transition_stride=cfg.get("transition_stride"),
         )
         try:
             apply_sseval_restore(runtime, cfg, config_path)
@@ -737,6 +738,7 @@ class SsEvalRLTRuntime:
                 actor_ready=self._episode_actor_ready,
                 actor_version=self._active_actor_version,
                 reference_seed=seed,
+                actor_mode="train" if self.actor_rollout_sampling else "eval",
             )
             actor_expected = songling_chunk_shape(self.chunk_len, self.action_dim)
             if candidates.actor_action.shape != actor_expected:

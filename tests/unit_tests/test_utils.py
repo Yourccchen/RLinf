@@ -30,6 +30,21 @@ from rlinf.runners.reasoning_runner import ReasoningRunner
 from rlinf.utils.metric_utils import compute_evaluate_metrics, compute_rollout_metrics
 
 
+def test_checkpoint_normalization_assets_survive_source_removal(tmp_path):
+    from rlinf.utils.checkpoint import save_normalization_assets
+
+    source = tmp_path / "source" / "norm_stats.json"
+    source.parent.mkdir()
+    content = '{"norm_stats": {"state": {}, "actions": {}}}'
+    source.write_text(content)
+    checkpoint = tmp_path / "actor"
+    save_normalization_assets(source, checkpoint, "xingchen/plug")
+    source.unlink()
+    assert (checkpoint / "norm_stats.json").read_text() == content
+    assert (checkpoint / "xingchen/plug/norm_stats.json").read_text() == content
+    assert not list(checkpoint.rglob("*.tmp"))
+
+
 def test_compute_evaluate_metrics_reports_interact_delay_wait_time_stats():
     metrics = compute_evaluate_metrics(
         [

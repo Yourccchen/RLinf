@@ -212,6 +212,7 @@ def predict_rlt_candidates(
     actor_ready: bool,
     actor_version: int,
     reference_seed: int,
+    actor_mode: Literal["train", "eval"] = "eval",
 ) -> tuple[DualActionCandidates, dict[str, torch.Tensor]]:
     """Return both physical VLA and Actor chunks without choosing execution mode."""
     device = next(feature_model.parameters()).device
@@ -232,7 +233,7 @@ def predict_rlt_candidates(
         clip=True,
     )
     actor_action, _ = policy_model.predict_action_batch(
-        env_obs=normalized_obs, mode="eval", return_obs=True
+        env_obs=normalized_obs, mode=actor_mode, return_obs=True
     )
     if isinstance(actor_action, np.ndarray):
         actor_action = torch.from_numpy(actor_action).to(normalized_obs["z_rl"].device)

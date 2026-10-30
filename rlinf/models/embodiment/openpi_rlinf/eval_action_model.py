@@ -185,13 +185,13 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
             wrist_images = env_obs.get("wrist_images", env_obs.get("extra_view_images"))
             if wrist_images is None:
                 raise KeyError(
-                    "Songling RLT observations require wrist_images (or "
+                    "Multi-view RLT observations require wrist_images (or "
                     "extra_view_images) containing left and right wrist views."
                 )
             wrist_shape = tuple(wrist_images.shape)
             if len(wrist_shape) != 5 or wrist_shape[1] != 2:
                 raise ValueError(
-                    "Songling wrist images must have shape [B, 2, H, W, C] "
+                    "RLT wrist images must have shape [B, 2, H, W, C] "
                     f"(left then right), got {wrist_shape}."
                 )
             processed_obs.update(

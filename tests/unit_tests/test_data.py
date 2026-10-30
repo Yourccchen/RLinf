@@ -21,6 +21,7 @@ import random
 import time
 from unittest import mock
 
+import numpy as np
 import pytest
 import torch
 from omegaconf import DictConfig
@@ -38,6 +39,72 @@ from rlinf.utils.obs_compression import (
     is_compressed_image,
     is_compression_enabled,
 )
+
+
+def test_ario_statistics_preserve_action_chunk_weighting():
+    pytest.importorskip("openpi")
+    from toolkits.calculate_ario_norm_stats import compute_statistics
+
+    samples = [
+        {"observation/state": np.zeros(31), "actions": np.ones((3, 31))},
+        {"observation/state": np.full(31, 2), "actions": np.full((3, 31), 3)},
+    ]
+    stats = compute_statistics(samples, action_dim=31)
+    np.testing.assert_allclose(stats["state"].mean, 1)
+    np.testing.assert_allclose(stats["actions"].mean, 2)
+    for entry in stats.values():
+        assert entry.mean.shape == (31,)
+        np.testing.assert_allclose(entry.std, 1)
+        assert np.all(entry.q01 <= entry.q99)
+
+
+def test_ario_statistics_apply_same_quantiles_to_gripper_and_pose():
+    pytest.importorskip("openpi")
+    from toolkits.calculate_ario_norm_stats import compute_statistics
+
+    values = np.zeros((512, 31))
+    values[:, 30] = -0.5
+    values[-1, 30] = 98.0
+    values[:, 0] = values[:, 30]
+    samples = [{"observation/state": value, "actions": value[None]} for value in values]
+    stats = compute_statistics(samples, 31)
+    for key in ("state", "actions"):
+        entry = stats[key]
+        assert entry.q01[0] == entry.q01[30]
+        assert entry.q99[0] == entry.q99[30]
+        assert entry.q99[30] < values[-1, 30]
+
+
+def test_xingchen_unified_state_preserves_semantic_pose_order():
+    pytest.importorskip("openpi")
+    from rlinf.data.datasets.openpi_rlinf.xingchen.ario_state_dataset import (
+        extract_xingchen_state,
+    )
+
+    fields = {
+        "endpose_torso": torch.full((2, 9), 1.0),
+        "qpos_head": torch.full((2, 2), 2.0),
+        "endpose_left": torch.full((2, 9), 3.0),
+        "gripper_left": torch.full((2, 1), 40.0),
+        "endpose_right": torch.full((2, 9), 5.0),
+        "gripper_right": torch.full((2, 1), 60.0),
+        "__canonical55__": torch.full((2, 55), -100.0),
+    }
+    values = extract_xingchen_state(fields)
+    expected = [1.0] * 9 + [2.0] * 2 + [3.0] * 9 + [40.0] + [5.0] * 9 + [60.0]
+    np.testing.assert_array_equal(values, np.tile(expected, (2, 1)))
+
+
+@pytest.mark.parametrize("invalid_value", [np.full(14, 1.0), np.full(31, np.nan)])
+def test_ario_statistics_reject_invalid_vectors(invalid_value):
+    pytest.importorskip("openpi")
+    from toolkits.calculate_ario_norm_stats import compute_statistics
+
+    with pytest.raises(ValueError, match="dimensions|non-finite"):
+        compute_statistics(
+            [{"observation/state": invalid_value, "actions": np.zeros((3, 31))}],
+            action_dim=31,
+        )
 
 
 class TestMathDatasetMultithread:
@@ -714,13 +781,21 @@ def test_ario_config_omits_unsupported_default_options():
             "index_cache_dir": "",
             "discover_from_data_lake": False,
             "index_workers": 32,
+            "excluded_episodes": (),
         },
     )
 
     assert config == LegacyArioConfig(s3_prefixes="s3://bucket/data/")
 
 
-def test_ario_config_rejects_unsupported_enabled_options():
+@pytest.mark.parametrize(
+    "option, value",
+    [
+        ("index_cache_dir", "/shared/index"),
+        ("excluded_episodes", ("s3://bucket/data/episode_90/",)),
+    ],
+)
+def test_ario_config_rejects_unsupported_enabled_options(option, value):
     pytest.importorskip("openpi")
     from rlinf.data.datasets.openpi_rlinf.xingchen.xingchen_sft_data_loader import (
         _create_ario_config,
@@ -730,12 +805,12 @@ def test_ario_config_rejects_unsupported_enabled_options():
     class LegacyArioConfig:
         s3_prefixes: str
 
-    with pytest.raises(RuntimeError, match="index_cache_dir"):
+    with pytest.raises(RuntimeError, match=option):
         _create_ario_config(
             LegacyArioConfig,
             {
                 "s3_prefixes": "s3://bucket/data/",
-                "index_cache_dir": "/shared/index",
+                option: value,
             },
         )
 

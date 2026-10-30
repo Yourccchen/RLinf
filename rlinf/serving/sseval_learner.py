@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 import queue
 import threading
 import time
@@ -75,6 +76,7 @@ class InProcessLearnerConfig:
     min_buffer_size: int = 1000
     replay_capacity: int = 50000
     utd: int = 5
+    replay_catch_up_max_updates: int = 0
     gamma: float = 0.99
     tau: float = 0.005
     actor_update_interval: int = 2
@@ -83,6 +85,9 @@ class InProcessLearnerConfig:
     actor_clip_grad: float = 10.0
     critic_clip_grad: float = 10.0
     reference_dropout_prob: float = 0.5
+    actor_objective: str = "scheduled_residual"
+    bc_regularizer_beta: float = 0.5
+    warmup_transitions: int = 0
     target_action_noise: bool = True
     actor_update_action_noise: bool = True
     residual_velocity_weight: float = 0.0
@@ -106,6 +111,14 @@ class InProcessLearnerConfig:
         if unknown:
             raise ValueError(f"Unknown SsEval learner settings: {unknown}")
         result = cls(**value)
+        if result.actor_objective not in {
+            "scheduled_residual",
+            "bc_regularized_q",
+        }:
+            raise ValueError(
+                "actor_objective must be 'scheduled_residual' or "
+                f"'bc_regularized_q', got {result.actor_objective!r}."
+            )
         for name in (
             "batch_size",
             "min_buffer_size",
@@ -119,12 +132,22 @@ class InProcessLearnerConfig:
         for name in (
             "residual_velocity_weight",
             "residual_acceleration_weight",
+            "bc_regularizer_beta",
         ):
             if float(getattr(result, name)) < 0:
                 raise ValueError(f"{name} must be non-negative.")
+        if int(result.warmup_transitions) < 0:
+            raise ValueError("warmup_transitions must be non-negative.")
+        if int(result.replay_catch_up_max_updates) < 0:
+            raise ValueError("replay_catch_up_max_updates must be non-negative.")
         if int(result.log_interval) < 0:
             raise ValueError("log_interval must be non-negative.")
         return result
+
+    @property
+    def uses_bc_regularized_q_objective(self) -> bool:
+        """Return whether Actor loss is ``beta * BC - Q``."""
+        return self.actor_objective == "bc_regularized_q"
 
 
 def residual_temporal_losses(
@@ -139,12 +162,10 @@ def residual_temporal_losses(
             f"{predicted_chunk.shape} and {reference_chunk.shape}."
         )
     if predicted_chunk.ndim != 3:
-        raise ValueError(
-            f"action chunks must be [B,C,A], got {predicted_chunk.shape}."
-        )
-    valid = valid_step_mask.to(
-        device=predicted_chunk.device, dtype=torch.bool
-    ).reshape(predicted_chunk.shape[0], predicted_chunk.shape[1])
+        raise ValueError(f"action chunks must be [B,C,A], got {predicted_chunk.shape}.")
+    valid = valid_step_mask.to(device=predicted_chunk.device, dtype=torch.bool).reshape(
+        predicted_chunk.shape[0], predicted_chunk.shape[1]
+    )
     residual = predicted_chunk - reference_chunk
     zero = residual.sum() * 0.0
 
@@ -152,15 +173,17 @@ def residual_temporal_losses(
         return zero, zero
     velocity_error = (residual[:, 1:] - residual[:, :-1]).square().mean(dim=-1)
     velocity_mask = valid[:, 1:] & valid[:, :-1]
-    velocity_loss = (velocity_error * velocity_mask).sum() / velocity_mask.sum().clamp_min(
-        1
-    )
+    velocity_loss = (
+        velocity_error * velocity_mask
+    ).sum() / velocity_mask.sum().clamp_min(1)
 
     if residual.shape[1] < 3:
         return velocity_loss, zero
     acceleration_error = (
-        residual[:, 2:] - 2.0 * residual[:, 1:-1] + residual[:, :-2]
-    ).square().mean(dim=-1)
+        (residual[:, 2:] - 2.0 * residual[:, 1:-1] + residual[:, :-2])
+        .square()
+        .mean(dim=-1)
+    )
     acceleration_mask = valid[:, 2:] & valid[:, 1:-1] & valid[:, :-2]
     acceleration_loss = (
         acceleration_error * acceleration_mask
@@ -200,11 +223,27 @@ class InProcessRLTTD3Learner:
             raise ValueError("save_dir is required when save_interval > 0.")
         if save_dir and self.save_interval > 0:
             self.save_dir = make_sseval_run_save_dir(save_dir)
-            logger.info("SsEval checkpoints will be written under %s", self.save_dir)
         elif save_dir:
             self.save_dir = Path(save_dir).expanduser()
         else:
             self.save_dir = None
+        self._logger = logging.getLogger(f"{logger.name}.sseval_learner.{id(self)}")
+        self._log_handler: logging.FileHandler | None = None
+        if self.save_dir is not None and self.save_interval > 0:
+            self._log_handler = logging.FileHandler(
+                self.save_dir / "training.log", encoding="utf-8"
+            )
+            self._log_handler.setFormatter(
+                logging.Formatter(
+                    "%(asctime)s | %(levelname)s | %(message)s",
+                    datefmt="%Y-%m-%d %H:%M:%S",
+                )
+            )
+            self._logger.addHandler(self._log_handler)
+            self._logger.info(
+                "SsEval checkpoints and training log will be written under %s",
+                self.save_dir,
+            )
         self._last_saved_step = 0
         self.model = model
         self.device = next(model.parameters()).device
@@ -246,6 +285,8 @@ class InProcessRLTTD3Learner:
 
     @property
     def actor_ready(self) -> bool:
+        if self.config.uses_bc_regularized_q_objective:
+            return self.total_transitions >= self.config.warmup_transitions
         return self.update_step >= self.config.warmup_updates
 
     @property
@@ -303,6 +344,8 @@ class InProcessRLTTD3Learner:
 
     def _objective_weights(self) -> tuple[float, float]:
         cfg = self.config
+        if cfg.uses_bc_regularized_q_objective:
+            return cfg.bc_regularizer_beta, 1.0
         if self.update_step < cfg.warmup_updates:
             return cfg.warmup_bc_weight, cfg.warmup_q_weight
         if cfg.ramp_updates <= 0:
@@ -378,6 +421,31 @@ class InProcessRLTTD3Learner:
             actions=batch["actions"],
         )
         critic_loss = F.mse_loss(q_values, target_q.expand_as(q_values))
+        with torch.no_grad():
+            # A positive delta means breaking this input-target pairing makes
+            # prediction worse, so the critic is using that input.
+            shuffled_actions = torch.roll(batch["actions"], shifts=1, dims=0)
+            shuffled_action_q = self.model(
+                forward_type=ForwardType.SAC_Q,
+                obs=batch["curr_obs"],
+                actions=shuffled_actions,
+            )
+            shuffled_obs = dict(batch["curr_obs"])
+            shuffled_obs["z_rl"] = torch.roll(
+                batch["curr_obs"]["z_rl"], shifts=1, dims=0
+            )
+            shuffled_z_q = self.model(
+                forward_type=ForwardType.SAC_Q,
+                obs=shuffled_obs,
+                actions=batch["actions"],
+            )
+            target_q_expanded = target_q.expand_as(q_values)
+            shuffle_action = (
+                F.mse_loss(shuffled_action_q, target_q_expanded) - critic_loss.detach()
+            )
+            shuffle_z_rl = (
+                F.mse_loss(shuffled_z_q, target_q_expanded) - critic_loss.detach()
+            )
         self.critic_optimizer.zero_grad(set_to_none=True)
         critic_loss.backward()
         critic_norm = torch.nn.utils.clip_grad_norm_(
@@ -394,7 +462,11 @@ class InProcessRLTTD3Learner:
         residual_velocity_value = float("nan")
         residual_acceleration_value = float("nan")
         residual_smoothness_value = float("nan")
-        actor_updated = (self.update_step + 1) % self.config.actor_update_interval == 0
+        actor_updated = (
+            self.update_step + 1
+        ) % self.config.actor_update_interval == 0 and (
+            not self.config.uses_bc_regularized_q_objective or self.actor_ready
+        )
         if actor_updated:
             predicted, _, _ = self.model(
                 forward_type=ForwardType.SAC,
@@ -441,13 +513,10 @@ class InProcessRLTTD3Learner:
             )
             residual_smoothness_loss = (
                 self.config.residual_velocity_weight * residual_velocity_loss
-                + self.config.residual_acceleration_weight
-                * residual_acceleration_loss
+                + self.config.residual_acceleration_weight * residual_acceleration_loss
             )
             actor_loss = (
-                bc_weight * bc_loss
-                - q_weight * q1.mean()
-                + residual_smoothness_loss
+                bc_weight * bc_loss - q_weight * q1.mean() + residual_smoothness_loss
             )
             self.actor_optimizer.zero_grad(set_to_none=True)
             self.critic_optimizer.zero_grad(set_to_none=True)
@@ -466,15 +535,11 @@ class InProcessRLTTD3Learner:
             residual_abs_value = float(
                 (smooth_chunk - ref_chunk).abs().mean().detach().cpu()
             )
-            residual_velocity_value = float(
-                residual_velocity_loss.detach().cpu()
-            )
+            residual_velocity_value = float(residual_velocity_loss.detach().cpu())
             residual_acceleration_value = float(
                 residual_acceleration_loss.detach().cpu()
             )
-            residual_smoothness_value = float(
-                residual_smoothness_loss.detach().cpu()
-            )
+            residual_smoothness_value = float(residual_smoothness_loss.detach().cpu())
             self._publish_candidate(self.update_step + 1)
         else:
             actor_norm = torch.zeros(())
@@ -485,6 +550,8 @@ class InProcessRLTTD3Learner:
             "critic_loss": float(critic_loss.detach().cpu()),
             "critic_grad_norm": float(critic_norm.detach().cpu()),
             "target_q": float(target_q.mean().detach().cpu()),
+            "shuffle_action": float(shuffle_action.cpu()),
+            "shuffle_z_rl": float(shuffle_z_rl.cpu()),
             "actor_loss": actor_loss_value,
             "actor_grad_norm": float(actor_norm.detach().cpu()),
             "bc_loss": bc_loss_value,
@@ -513,15 +580,18 @@ class InProcessRLTTD3Learner:
         # The actor only updates every ``actor_update_interval`` steps, so reuse
         # the most recent actor values instead of logging NaN.
         metrics = {**self._last_metrics, **self._last_actor_metrics}
-        logger.info(
+        self._logger.info(
             "SsEval TD3 step=%d replay=%d actor_ready=%s | critic_loss=%.4f "
-            "target_q=%.4f | actor_loss=%.4f bc=%.5f q_pi=%.4f "
+            "target_q=%.4f shuffle_action=%+.6f shuffle_z_rl=%+.6f | "
+            "actor_loss=%.4f bc=%.5f q_pi=%.4f "
             "(bc_w=%.2f q_w=%.3f) | residual_abs=%.5f smooth=%.5f",
             int(metrics["update_step"]),
             int(metrics["replay_size"]),
             self.actor_ready,
             metrics["critic_loss"],
             metrics["target_q"],
+            metrics["shuffle_action"],
+            metrics["shuffle_z_rl"],
             metrics["actor_loss"],
             metrics["bc_loss"],
             metrics["q_pi"],
@@ -577,7 +647,9 @@ class InProcessRLTTD3Learner:
         if step == self._last_saved_step:
             return
         path = self._checkpoint_path(step)
-        logger.info("Saving SsEval checkpoint at update_step %s to %s", step, path)
+        self._logger.info(
+            "Saving SsEval checkpoint at update_step %s to %s", step, path
+        )
         self._write_checkpoint(path)
         self._last_saved_step = step
 
@@ -662,20 +734,26 @@ class InProcessRLTTD3Learner:
             min_buffer_size=self.config.min_buffer_size,
             utd=self.config.utd,
         )
+        desired_updates = updates
+        max_updates = int(self.config.replay_catch_up_max_updates)
+        if max_updates > 0:
+            updates = min(updates, max_updates)
         if updates <= 0:
-            logger.info(
+            self._logger.info(
                 "Replay has %s samples < min_buffer_size %s; skipping catch-up.",
                 samples,
                 self.config.min_buffer_size,
             )
             return
-        logger.info(
-            "Catching up %s TD3 updates from %s replay samples "
-            "(min_buffer_size=%s, utd=%s).",
+        self._logger.info(
+            "Catching up %s/%s updates from %s replay samples "
+            "(min_buffer_size=%s, utd=%s, max_updates=%s).",
             updates,
+            desired_updates,
             samples,
             self.config.min_buffer_size,
             self.config.utd,
+            max_updates,
         )
         for _ in range(updates):
             self.train_once()
@@ -693,3 +771,7 @@ class InProcessRLTTD3Learner:
         with self._train_lock:
             self._maybe_save(force=True)
         self.replay.close()
+        if self._log_handler is not None:
+            self._logger.removeHandler(self._log_handler)
+            self._log_handler.close()
+            self._log_handler = None

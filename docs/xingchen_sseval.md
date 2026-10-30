@@ -5,6 +5,8 @@ Omitting this field retains Songling QPOS14 behavior. RWI owns hardware and
 geometry adaptation; RLinf owns candidate inference, replay and learner updates.
 
 Use `examples/embodiment/config/xingchen_rlt_sseval_td3.yaml` for OpenPI.
+Xingchen and Songling both use `rlt_td3_mlp_policy` for RLT Stage2.
+Their observation and action layouts differ; HALO-WA uses its own Stage2 model.
 Supply its Stage1 paths and physical 25D bounds through `XINGCHEN_*` variables.
 RWI injects `XingchenFeatureAdapter` through
 `SsEvalRLTRuntime.from_config(feature_model_adapter=...)` to convert the trained

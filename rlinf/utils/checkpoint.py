@@ -14,8 +14,38 @@
 
 import os
 import re
+import shutil
+from pathlib import Path
 
 CHECKPOINT_COMMIT_MARKER = "COMMITTED"
+
+
+def save_normalization_assets(
+    source: str | os.PathLike[str],
+    checkpoint_dir: str | os.PathLike[str],
+    asset_id: str | None = None,
+) -> None:
+    """Bundle normalization JSON beside weights and under its OpenPI asset ID.
+
+    The root copy supports an explicit ``norm_stats_path``. The asset copy lets
+    OpenPI resolve statistics from the checkpoint without the original source.
+    Files are replaced atomically before the runner commits the checkpoint.
+    """
+    source = Path(source).expanduser()
+    if source.is_dir():
+        source = source / "norm_stats.json"
+    root = Path(checkpoint_dir)
+    destinations = {root / "norm_stats.json"}
+    if asset_id:
+        relative = Path(asset_id)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("Normalization asset_id must be a relative directory.")
+        destinations.add(root / relative / "norm_stats.json")
+    for destination in destinations:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_suffix(".json.tmp")
+        shutil.copyfile(source, temporary)
+        temporary.replace(destination)
 
 
 def parse_global_step_from_checkpoint_path(

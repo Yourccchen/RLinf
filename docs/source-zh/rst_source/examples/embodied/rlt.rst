@@ -775,3 +775,29 @@ rollout worker 会返回 RLT 特征，learner 侧把这些特征组装成 transi
 - Stage 1、Stage 2 和 checkpoint assets 中的 ``norm_stats.json`` 必须来自同一套数据语义和同一个 ``repo_id``。推荐通过 ``openpi_data.norm_stats_path`` 显式指定，避免 Stage 1 checkpoint 未写入 norm stats 时加载失败。
 - ``rollout.rlt_feature_model.model_path`` 应指向 Stage 1 FSDP 检查点下的 ``actor`` 目录，例如 ``.../checkpoints/global_step_<step>/actor``。不要把 RLT Stage 1 checkpoint 转成裸 ``model.safetensors`` 再给 Stage 2 使用，因为 RLT token module 保存在完整 wrapper checkpoint 中。
 - 添加仿真示例时，可以新建仿真环境配置，保留 ``loss_type: rlt_ac`` 和 ``rollout.rlt_feature_model``，再把真机阶段切换逻辑替换成适合仿真的逻辑。
+
+Xingchen SsEval 在线接管
+----------------------
+
+``examples/embodiment/config/xingchen_rlt_sseval_td3.yaml`` 用于 RWI Policy
+进程内的 SsEval runtime，不是分布式训练提交入口。RWI 使用
+``policy/config_rlinf_xingchen_rlt.yaml``，并设置 ``embodiment: xingchen``。
+
+该边界保留 Stage1 的 31D rot6d 训练输入，通过 RWI 已有
+``AstribotEefProcessor`` 转换为机器人、Stage2 和 replay 使用的 25D EEF。
+``SsEvalRLTRuntime.from_config`` 接收 RWI 提供的 ``feature_model_adapter``；
+未提供 adapter 时仍要求 Stage1/Stage2 动作维度一致。
+三路相机映射为 head、left wrist、right wrist。
+
+部署前设置 ``XINGCHEN_STAGE1_CONFIG``、``XINGCHEN_STAGE1_CHECKPOINT``、
+``XINGCHEN_NORM_STATS``，以及两份 25 个数值的 JSON 列表
+``XINGCHEN_ACTION_LOW`` / ``XINGCHEN_ACTION_HIGH``。动作顺序为
+躯干 xyz+xyzw、头部两个关节、左臂 xyz+xyzw+夹爪、右臂 xyz+xyzw+夹爪。
+动作上下界必须与实机任务及此顺序一致；配置不提供猜测的边界或 checkpoint。
+
+采集沿用 Songling 的 ``r`` 键关键阶段门控。VR 接管不会自行开启 replay。
+人工反馈中的有效步带 ``intervene_flags``，learner 用实际执行动作覆盖这些步的
+reference/BC target；success/failure 收口时入库，abort 丢弃本 episode 缓冲。
+RWI、RLinf 和 SsEvalPlatform 需一起更新，SEP 必须支持 25D 候选动作及可变
+chunk horizon。操作和 CPU smoke 范围见 RWI 的
+``docs/rlinf_rlt_slave_contract.md``。

@@ -1,3 +1,17 @@
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import copy
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,11 +24,14 @@ from rlinf.algorithms.rlt.rollout import (
     validate_online_transition_stride,
     validate_rlt_stage2_configs,
 )
-from rlinf.algorithms.rlt.route import RLTRouteContext, RealworldRLTRoute
+from rlinf.algorithms.rlt.route import RealworldRLTRoute, RLTRouteContext
 from rlinf.algorithms.rlt.transition import overwrite_rlt_ref_with_human
 from rlinf.data.schema.embodied_types import Trajectory
 from rlinf.data.storage.replay.buffer import TrajectoryReplayBuffer
 from rlinf.models.embodiment.base_policy import ForwardType
+from rlinf.models.embodiment.mlp_policy.rlt_paper_mlp_policy import (
+    RLTPaperMLPPolicy,
+)
 from rlinf.models.embodiment.mlp_policy.rlt_td3_mlp_policy import RLTTD3MLPPolicy
 from rlinf.models.embodiment.openpi_rlinf.eval_action_model import (
     OpenPiPytorchEvalActionModel,
@@ -233,6 +250,171 @@ def test_td3_get_model_wires_actor_residual():
     assert model.actor.residual is True
 
 
+def test_paper_actor_samples_during_training_and_uses_mean_for_eval():
+    torch.manual_seed(0)
+    policy = RLTPaperMLPPolicy(
+        z_dim=8,
+        proprio_dim=4,
+        action_dim=2,
+        num_action_chunks=3,
+        fixed_std=0.2,
+    )
+    obs = {
+        "z_rl": torch.randn(4, 8),
+        "proprio": torch.randn(4, 4),
+        "ref_chunk": torch.randn(4, 3, 2),
+    }
+
+    deterministic, _, _ = policy(
+        forward_type=ForwardType.SAC,
+        obs=copy.deepcopy(obs),
+        deterministic=True,
+    )
+    no_noise, _, _ = policy(
+        forward_type=ForwardType.SAC,
+        obs=copy.deepcopy(obs),
+        apply_action_noise=False,
+    )
+    torch.testing.assert_close(deterministic, no_noise)
+
+    torch.manual_seed(1)
+    sampled, _, _ = policy(
+        forward_type=ForwardType.SAC,
+        obs=copy.deepcopy(obs),
+        apply_action_noise=True,
+    )
+    assert not torch.allclose(sampled, deterministic)
+    eval_actions, _ = policy.predict_action_batch(copy.deepcopy(obs), mode="eval")
+    torch.testing.assert_close(eval_actions.flatten(1), deterministic)
+
+
+def test_paper_actor_reference_dropout_removes_reference_pass_through():
+    policy = RLTPaperMLPPolicy(
+        z_dim=2,
+        proprio_dim=2,
+        action_dim=1,
+        num_action_chunks=2,
+        fixed_std=0.002,
+    )
+    obs_a = {
+        "z_rl": torch.zeros(3, 2),
+        "proprio": torch.zeros(3, 2),
+        "ref_chunk": torch.zeros(3, 2, 1),
+    }
+    obs_b = copy.deepcopy(obs_a)
+    obs_b["ref_chunk"].fill_(0.75)
+
+    actions_a, _, _ = policy(
+        forward_type=ForwardType.SAC,
+        obs=obs_a,
+        deterministic=True,
+        apply_reference_dropout=True,
+        reference_dropout_prob=1.0,
+    )
+    actions_b, _, _ = policy(
+        forward_type=ForwardType.SAC,
+        obs=obs_b,
+        deterministic=True,
+        apply_reference_dropout=True,
+        reference_dropout_prob=1.0,
+    )
+    torch.testing.assert_close(actions_a, actions_b)
+
+
+def test_paper_residual_actor_starts_from_reference_chunk():
+    policy = RLTPaperMLPPolicy(
+        z_dim=2,
+        proprio_dim=2,
+        action_dim=1,
+        num_action_chunks=2,
+        fixed_std=0.002,
+        actor_residual=True,
+    )
+    obs = {
+        "z_rl": torch.randn(3, 2),
+        "proprio": torch.randn(3, 2),
+        "ref_chunk": torch.tensor([[[-0.5], [0.25]], [[0.1], [0.8]], [[-0.9], [0.0]]]),
+    }
+
+    actions, _, _ = policy(
+        forward_type=ForwardType.SAC,
+        obs=obs,
+        deterministic=True,
+    )
+
+    torch.testing.assert_close(actions.reshape_as(obs["ref_chunk"]), obs["ref_chunk"])
+
+
+def test_paper_get_model_wires_configurable_gaussian_actor():
+    from rlinf.models.embodiment.mlp_policy import get_model as get_mlp_model
+
+    cfg = OmegaConf.create(
+        {
+            "model_type": "rlt_paper_mlp_policy",
+            "z_dim": 8,
+            "proprio_dim": 4,
+            "action_dim": 2,
+            "num_action_chunks": 3,
+            "mlp_hidden_dim": 32,
+            "mlp_num_hidden_layers": 2,
+            "projection_dim": 16,
+            "fixed_std": 0.03,
+            "actor_residual": True,
+        }
+    )
+    model = get_mlp_model(cfg)
+    linear_layers = [
+        module
+        for module in model.actor.mlp.modules()
+        if isinstance(module, torch.nn.Linear)
+    ]
+
+    assert len(linear_layers) == 3
+    assert linear_layers[0].out_features == 32
+    assert model.projection_dim == 16
+    assert model.actor.z_projection.linear.out_features == 16
+    assert model.q_head.q1.action_projection.linear.out_features == 16
+    assert model.actor.fixed_std == pytest.approx(0.03)
+    assert model.actor.residual is True
+    assert all(not key.startswith("q_head") for key in model.actor.state_dict())
+
+
+def test_paper_critic_projects_all_branches_and_uses_reference():
+    torch.manual_seed(0)
+    policy = RLTPaperMLPPolicy(
+        z_dim=8,
+        proprio_dim=4,
+        action_dim=2,
+        num_action_chunks=3,
+        projection_dim=6,
+    )
+    obs = {
+        "z_rl": torch.randn(4, 8),
+        "proprio": torch.randn(4, 4),
+        "ref_chunk": torch.randn(4, 3, 2),
+    }
+    actions = torch.randn(4, 6).clamp(-1.0, 1.0)
+    q_values = policy(
+        forward_type=ForwardType.SAC_Q,
+        obs=obs,
+        actions=actions,
+    )
+    changed_reference = copy.deepcopy(obs)
+    changed_reference["ref_chunk"] = obs["ref_chunk"] + 0.5
+    changed_q = policy(
+        forward_type=ForwardType.SAC_Q,
+        obs=changed_reference,
+        actions=actions,
+    )
+
+    assert q_values.shape == (4, 2)
+    assert not torch.allclose(q_values, changed_q)
+    assert policy.q_head.q1.z_projection.linear.out_features == 6
+    assert policy.q_head.q1.proprio_projection.linear.out_features == 6
+    assert policy.q_head.q1.reference_projection.linear.out_features == 6
+    assert policy.q_head.q1.action_projection.linear.out_features == 6
+
+
 def _songling_eval_wrapper() -> OpenPiPytorchEvalActionModel:
     wrapper = object.__new__(OpenPiPytorchEvalActionModel)
     wrapper.config_name = "pi05_rlt_songling_joint"
@@ -301,14 +483,18 @@ def test_songling_rlt_proprio_uses_normalized_stage1_state():
     assert torch.equal(proprio, normalized[:, :14])
 
 
-def test_songling_repack_preserves_all_three_camera_views():
+@pytest.mark.parametrize("config_name,dim", [
+    ("pi05_rlt_songling_joint", 14), ("pi05_rlt_xingchen_joint", 31),
+])
+def test_repack_preserves_all_three_camera_views(config_name, dim):
     wrapper = _songling_eval_wrapper()
+    wrapper.config_name = config_name
     main = torch.zeros(2, 32, 48, 3, dtype=torch.uint8)
     wrists = torch.stack([torch.ones_like(main), torch.full_like(main, 2)], dim=1)
 
     repacked = wrapper._repack_env_obs(
         {
-            "states": torch.zeros(2, 14),
+            "states": torch.zeros(2, dim),
             "main_images": main,
             "wrist_images": wrists,
             "task_descriptions": ["fold clothes", "fold clothes"],
