@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 import re
 import threading
 from dataclasses import dataclass
@@ -32,6 +33,8 @@ from rlinf.serving.sseval_learner import (
     InProcessLearnerConfig,
     InProcessRLTTD3Learner,
 )
+
+logger = logging.getLogger(__name__)
 
 _FEATURE_KEYS_FROM_SFT = (
     "model_type",
@@ -459,6 +462,8 @@ class SsEvalRLTRuntime:
         self._next_chunk_id = 0
         self._pending: _PendingInference | None = None
         self._episode_buffer: list[Trajectory] = []
+        self._ario_receipts = None
+        self._ario_key = None
         self._stride_actions: list[torch.Tensor] = []
         self._stride_rewards: list[torch.Tensor] = []
         self._stride_terminated: list[torch.Tensor] = []
@@ -519,6 +524,43 @@ class SsEvalRLTRuntime:
         )
         apply_sseval_restore(runtime, cfg, config_path)
         return runtime
+
+    def enable_ario_recording(self, run_id: str) -> None:
+        """Enable receipts for the active episode; raw data stays on the robot."""
+        from rlinf.serving.replay_receipts import ReplayReceipts
+
+        if self._episode_id is None:
+            raise RuntimeError("Start an episode before enabling ARIO recording")
+        if self._ario_receipts is None:
+            if self.learner.save_dir is None:
+                raise ValueError("ARIO receipts require the existing learner save_dir")
+            self._ario_receipts = ReplayReceipts(
+                Path(self.learner.save_dir) / "ario_receipts"
+            )
+        self._ario_key = f"{run_id}:{self._episode_id}"
+        if not self._ario_receipts.contains(self._ario_key):
+            self._ario_receipts.start(
+                self._ario_key,
+                self._instruction,
+                self._episode_id,
+            )
+
+    def ario_status(self, episode_id: str, run_id: str) -> dict[str, Any]:
+        """Return persisted acceptance state, including after episode reset."""
+        from rlinf.serving.replay_receipts import ReplayReceipts
+
+        if self._ario_receipts is not None:
+            return self._ario_receipts.status(f"{run_id}:{episode_id}")
+        if self.learner.save_dir is not None:
+            return ReplayReceipts(Path(self.learner.save_dir) / "ario_receipts").status(
+                f"{run_id}:{episode_id}"
+            )
+        return {"episode_id": episode_id, "complete": False}
+
+    def _ario_recording(self) -> bool:
+        return self._ario_receipts is not None and self._ario_receipts.contains(
+            self._ario_key
+        )
 
     @property
     def active_actor_version(self) -> int:
@@ -796,10 +838,49 @@ class SsEvalRLTRuntime:
     def _resolve_episode_buffer(self, feedback: TransitionFeedback) -> None:
         trajectories = self._episode_buffer
         self._episode_buffer = []
+        recording = self._ario_recording()
+        if recording:
+            records = (
+                [
+                    {
+                        "weights_id": item.model_weights_id,
+                        "accepted": False,
+                    }
+                    for item in trajectories
+                ]
+                if feedback.has_labeled_outcome
+                else []
+            )
+            try:
+                self._ario_receipts.expect(self._ario_key, records)
+            except Exception:
+                logger.exception("ARIO receipt preparation failed")
+                recording = False
         if not feedback.has_labeled_outcome:
+            if recording:
+                try:
+                    self._ario_receipts.finish(self._ario_key)
+                except Exception:
+                    logger.exception("ARIO receipt finalization failed")
             return
         for trajectory in trajectories:
+            if recording:
+                from functools import partial
+
+                self.learner.observe_replay(
+                    trajectory.model_weights_id,
+                    partial(
+                        self._ario_receipts.accept,
+                        self._ario_key,
+                        trajectory.model_weights_id,
+                    ),
+                )
             self.learner.submit(trajectory)
+        if recording:
+            try:
+                self._ario_receipts.finish(self._ario_key)
+            except Exception:
+                logger.exception("ARIO receipt finalization failed")
 
     def _relabel_buffered_terminal(self, feedback: TransitionFeedback) -> bool:
         weights_id = sseval_replay_weights_id(
@@ -826,6 +907,7 @@ class SsEvalRLTRuntime:
         return False
 
     def _close_episode(self) -> None:
+        self._ario_key = None
         self._episode_id = None
         self._instruction = ""
         self._pending = None
@@ -943,4 +1025,8 @@ class SsEvalRLTRuntime:
             self._closed = True
             self._close_episode()
             self._seen_feedback.clear()
-            self.learner.close()
+            try:
+                self.learner.close()
+            finally:
+                if self._ario_receipts is not None:
+                    self._ario_receipts.close()

@@ -1276,8 +1276,8 @@ def test_align_checked_in_songling_sft_config():
     assert cfg.feature_model.num_action_chunks == 50
     assert cfg.feature_model.openpi.action_horizon == 50
     assert cfg.feature_model.openpi.action_chunk == 50
-    assert cfg.actor_model.num_action_chunks == 10
-    assert cfg.actor_model.ref_num_action_chunks == 10
+    assert cfg.actor_model.num_action_chunks == 20
+    assert cfg.actor_model.ref_num_action_chunks == 20
     raw_feature = OmegaConf.to_container(cfg.feature_model, resolve=False)
     raw_actor = OmegaConf.to_container(cfg.actor_model, resolve=False)
     validate_rlt_stage2_configs(raw_actor, raw_feature)
@@ -1332,3 +1332,333 @@ def test_residual_temporal_losses_ignore_invalid_tail():
 def test_learner_rejects_negative_residual_smoothness_weights():
     with pytest.raises(ValueError, match="residual_velocity_weight"):
         InProcessLearnerConfig.from_mapping({"residual_velocity_weight": -0.1})
+
+
+def test_ario_receipt_waits_for_actual_insertion_and_survives_reset(tmp_path):
+    runtime, _ = _runtime()
+    runtime.learner.save_dir = tmp_path
+    callbacks = {}
+    runtime.learner.observe_replay = lambda key, callback: callbacks.setdefault(
+        key, callback
+    )
+    runtime.start_episode("episode-1", "build blocks")
+    runtime.enable_ario_recording("run-1")
+    runtime.infer_candidates(_observation())
+    runtime.end_episode(_feedback(0, done=True))
+    assert not runtime.ario_status("episode-1", "run-1")["complete"]
+    assert len(callbacks) == len(runtime.learner.submitted) == 1
+    next(iter(callbacks.values()))()
+    runtime.reset()
+    status = runtime.ario_status("episode-1", "run-1")
+    assert status["complete"]
+    assert status["transitions"] == [
+        {"weights_id": runtime.learner.submitted[0].model_weights_id, "accepted": True}
+    ]
+    runtime.start_episode("episode-1", "build blocks")
+    runtime.enable_ario_recording("run-2")
+    assert not runtime.ario_status("episode-1", "run-2")["complete"]
+    assert runtime.ario_status("episode-1", "run-1")["complete"]
+    runtime.close()
+
+
+@pytest.mark.parametrize(
+    "outcome,critical_phase,accepted",
+    [
+        ("success", True, True),
+        ("failure", True, True),
+        ("abort", True, False),
+        ("success", False, False),
+    ],
+)
+def test_ario_episode_requires_labeled_outcome_and_replay_insertion(
+    tmp_path, outcome, critical_phase, accepted
+):
+    runtime, _ = _runtime()
+    runtime.learner.save_dir = tmp_path
+    callbacks = []
+    runtime.learner.observe_replay = lambda key, callback: callbacks.append(callback)
+    try:
+        runtime.start_episode("episode-1", "build blocks")
+        runtime.enable_ario_recording("run")
+        runtime.infer_candidates(_observation())
+        runtime.end_episode(
+            _feedback(
+                done=outcome != "abort",
+                truncated=outcome == "abort",
+                reward=float(outcome == "success"),
+                critical_phase=critical_phase,
+            )
+        )
+        assert len(runtime.learner.submitted) == int(accepted)
+        if accepted:
+            assert not runtime.ario_status("episode-1", "run")["complete"]
+        for callback in callbacks:
+            callback()
+        status = runtime.ario_status("episode-1", "run")
+        assert status["complete"]
+        assert bool(status["transitions"]) == accepted
+    finally:
+        runtime.close()
+
+
+def test_learner_receipt_observer_failure_does_not_change_replay():
+    learner = _td3_learner()
+    trajectory = _offline_rlt_trajectory()
+
+    def fail():
+        raise OSError("receipt disk full")
+
+    learner.observe_replay(trajectory.model_weights_id, fail)
+    learner.add_and_train(trajectory)
+    assert learner.replay.total_samples > 0
+    learner.close()
+
+
+def test_ario_episode_waits_for_all_replay_insertions(tmp_path):
+    learner = FakeLearner()
+    learner.save_dir = tmp_path
+    callbacks = []
+    learner.observe_replay = lambda key, callback: callbacks.append(callback)
+    runtime = SsEvalRLTRuntime(
+        feature_model=FakeFeatureModel(),
+        active_policy_model=RLTTD3MLPPolicy(
+            z_dim=8,
+            proprio_dim=14,
+            action_dim=14,
+            num_action_chunks=4,
+        ),
+        action_codec=SonglingActionCodec([-1.0] * 14, [1.0] * 14),
+        learner=learner,
+        chunk_len=4,
+        transition_stride=2,
+    )
+    observation = _observation()
+    runtime.start_episode("episode-1", "build")
+    runtime.enable_ario_recording("run")
+    runtime.infer_candidates(observation)
+    for chunk in range(2):
+        feedback = _feedback(chunk, chunk_len=4, done=chunk == 1)
+        feedback["intermediate_observations"] = _intermediate_observations(0.0)
+        if chunk == 0:
+            runtime.infer_candidates(observation, feedback)
+        else:
+            runtime.end_episode(feedback)
+    assert len(learner.submitted) == len(callbacks) == 3
+    callbacks[0]()
+    assert not runtime.ario_status("episode-1", "run")["complete"]
+    for callback in callbacks[1:]:
+        callback()
+    receipt = runtime.ario_status("episode-1", "run")
+    assert receipt["complete"]
+    assert receipt["transitions"] == [
+        {"weights_id": item.model_weights_id, "accepted": True}
+        for item in learner.submitted
+    ]
+    runtime.close()
+
+
+def test_replay_receipts_slow_disk_does_not_block_acceptance(tmp_path, monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from rlinf.serving.replay_receipts import ReplayReceipts
+
+    entered, release = threading.Event(), threading.Event()
+    original = Path.write_text
+
+    def slow_write(path, *args, **kwargs):
+        if path.parent == tmp_path:
+            entered.set()
+            assert release.wait(3)
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", slow_write)
+    store = ReplayReceipts(tmp_path)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            start = executor.submit(store.start, "run:episode", "build", "episode")
+            assert entered.wait(1)
+            try:
+                start.result(timeout=0.2)
+                store.expect(
+                    "run:episode",
+                    [{"weights_id": "w", "accepted": False}],
+                )
+                executor.submit(store.accept, "run:episode", "w").result(timeout=0.2)
+                store.finish("run:episode")
+            finally:
+                release.set()
+        assert store.status("run:episode")["complete"]
+    finally:
+        release.set()
+        store.close()
+    recovered = ReplayReceipts(tmp_path)
+    assert recovered.status("run:episode")["complete"]
+    recovered.close()
+
+
+def test_replay_receipt_disk_failure_never_authorizes_export(tmp_path, monkeypatch):
+    from rlinf.serving.replay_receipts import ReplayReceipts
+
+    def disk_full(*args, **kwargs):
+        raise OSError(28, "Injected disk full")
+
+    monkeypatch.setattr(Path, "write_text", disk_full)
+    store = ReplayReceipts(tmp_path)
+    try:
+        store.start("run:episode", "build", "episode")
+        store.expect("run:episode", [{"weights_id": "w", "accepted": False}])
+        store.accept("run:episode", "w")
+        store.finish("run:episode")
+        result = store.status("run:episode")
+        assert not result["complete"]
+        assert "disk full" in result["error"]
+    finally:
+        store.close()
+
+
+def _assert_recording_results_equal(before, after):
+    if isinstance(before, dict):
+        assert before.keys() == after.keys()
+        for key in before:
+            _assert_recording_results_equal(before[key], after[key])
+    elif isinstance(before, (list, tuple)):
+        assert len(before) == len(after)
+        for left, right in zip(before, after, strict=True):
+            _assert_recording_results_equal(left, right)
+    elif isinstance(before, torch.Tensor):
+        torch.testing.assert_close(before, after, rtol=0, atol=0)
+    elif isinstance(before, np.ndarray):
+        np.testing.assert_array_equal(before, after)
+    else:
+        assert before == after
+
+
+@pytest.mark.parametrize("stride", [2, 20])
+@pytest.mark.parametrize("sample", [False, True])
+@pytest.mark.parametrize("outcome", ["success", "failure", "abort"])
+def test_ario_recording_preserves_gaussian_actions_and_replay(
+    tmp_path, stride, sample, outcome
+):
+    from dataclasses import asdict
+
+    results = []
+    for recording in (False, True):
+        torch.manual_seed(123)
+        policy = RLTPaperMLPPolicy(
+            z_dim=8,
+            proprio_dim=14,
+            action_dim=14,
+            num_action_chunks=20,
+            projection_dim=8,
+            fixed_std=0.002,
+            actor_residual=True,
+        )
+        learner = FakeLearner()
+        learner.save_dir = tmp_path
+        callbacks = []
+        learner.observe_replay = lambda key, callback: callbacks.append(callback)
+        runtime = SsEvalRLTRuntime(
+            feature_model=FakeFeatureModel(),
+            active_policy_model=policy,
+            action_codec=SonglingActionCodec([-1.0] * 14, [1.0] * 14),
+            learner=learner,
+            chunk_len=20,
+            transition_stride=stride,
+            actor_rollout_sampling=sample,
+        )
+        try:
+            runtime.start_episode("episode-1", "build blocks")
+            if recording:
+                runtime.enable_ario_recording("run")
+            candidates = [runtime.infer_candidates(_observation())]
+            for chunk in range(2):
+                feedback = _feedback(
+                    chunk,
+                    chunk_len=20,
+                    done=chunk == 1 and outcome != "abort",
+                    truncated=chunk == 1 and outcome == "abort",
+                    reward=float(outcome == "success"),
+                    mode="human",
+                )
+                feedback["intermediate_observations"] = _intermediate_observations(
+                    *range(2, 20, 2)
+                )
+                if chunk == 0:
+                    candidates.append(
+                        runtime.infer_candidates(_observation(20), feedback)
+                    )
+                else:
+                    runtime.end_episode(feedback)
+            for callback in callbacks:
+                callback()
+            if recording:
+                assert runtime.ario_status("episode-1", "run")["complete"]
+            results.append((candidates, [asdict(t) for t in learner.submitted]))
+        finally:
+            runtime.close()
+    for before, after in zip(results[0][0], results[1][0], strict=True):
+        np.testing.assert_array_equal(before.actor_action, after.actor_action)
+        np.testing.assert_array_equal(before.vla_action, after.vla_action)
+        _assert_recording_results_equal(
+            before.to_action_kwargs(), after.to_action_kwargs()
+        )
+    _assert_recording_results_equal(results[0][1], results[1][1])
+
+
+@pytest.mark.parametrize("warmup_transitions", [0, 2])
+def test_ario_receipts_preserve_learner_checkpoint(tmp_path, warmup_transitions):
+    from rlinf.serving.replay_receipts import ReplayReceipts
+
+    states = []
+    for recording in (False, True):
+        torch.manual_seed(123)
+        learner = InProcessRLTTD3Learner(
+            RLTPaperMLPPolicy(
+                z_dim=8,
+                proprio_dim=14,
+                action_dim=14,
+                num_action_chunks=10,
+                projection_dim=8,
+                fixed_std=0.002,
+                actor_residual=True,
+            ),
+            InProcessLearnerConfig(
+                batch_size=1,
+                min_buffer_size=1,
+                replay_capacity=8,
+                utd=2,
+                actor_objective="bc_regularized_q",
+                bc_regularizer_beta=50,
+                residual_velocity_weight=50,
+                residual_acceleration_weight=20,
+                warmup_transitions=warmup_transitions,
+            ),
+            start_background=False,
+        )
+        receipts = ReplayReceipts(tmp_path / "receipts")
+        trajectory = _offline_rlt_trajectory()
+        try:
+            if recording:
+                receipts.start("run:episode", "build", "episode")
+                receipts.expect(
+                    "run:episode",
+                    [{"weights_id": trajectory.model_weights_id, "accepted": False}],
+                )
+                learner.observe_replay(
+                    trajectory.model_weights_id,
+                    lambda: receipts.accept("run:episode", trajectory.model_weights_id),
+                )
+            learner.add_and_train(trajectory)
+            learner.add_and_train(copy.deepcopy(trajectory))
+            learner.add_and_train(copy.deepcopy(trajectory))
+            if recording:
+                receipts.finish("run:episode")
+                assert receipts.status("run:episode")["complete"]
+            checkpoint = tmp_path / str(recording)
+            learner.save_checkpoint(checkpoint)
+            states.append(torch.load(checkpoint / "learner.pt", weights_only=False))
+        finally:
+            learner.close()
+            receipts.close()
+    torch.testing.assert_close(states[0], states[1], rtol=0, atol=0)

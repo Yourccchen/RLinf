@@ -74,3 +74,40 @@ tests without starting PolicyServer:
 cd /home/fanyiming/RealWorldInference-fym
 python -m pytest -q tests/test_rlinf_policy.py
 ```
+
+## Optional robot-local ARIO export
+
+RealWorldInference can record raw Songling observations and actual commands during
+the critical phase using `policy.recording.save_ario` in its policy YAML. Both the
+recording switch and robot-local output path are forwarded at session start. Raw images and
+states stay on the robot; RLinf only keeps small acceptance receipts under the
+existing learner run directory's `ario_receipts/`. Existing configuration,
+trajectory serialization, training and checkpoint behavior remain unchanged.
+
+The RWI policy adapter uses optional `ario_run_id` observation metadata to
+call `enable_ario_recording(run_id)` after `start_episode(episode_id, instruction)`.
+After terminal feedback, it queries `ario_status(episode_id, run_id)` outside the
+inference thread. Receipts track trajectory identifiers and their replay acceptance.
+Acceptance is marked only after `replay.add_trajectories` succeeds. A complete
+receipt requires the episode's original outcome decision and all selected
+insertions. An aborted episode has no accepted transitions.
+
+The policy adapter exposes `ario_status(episode_id, run_id)` for the SEP backend
+relay. Queries survive episode reset and read persisted receipts. A missing or
+failed receipt remains incomplete; it cannot authorize an ARIO export. Receipt
+IO failures are logged separately and do not undo replay insertion. Robot-side
+capture appends each controller publication in execution order at the executor's
+publish rate while the critical phase is active, and stops when that phase or the
+session ends. Held commands during that phase remain part of the execution record.
+A normal human success or failure label and confirmed replay insertion commit the
+whole recording. Aborts and complete receipts with no insertions discard it.
+Receipts confirm episode acceptance without selecting ARIO frames.
+Normally scored episodes with unavailable receipts remain
+pending. This change does not modify the SFT loader or launch training.
+
+Receipt updates are coalesced on a bounded background writer queue. Replay
+insertion does not wait for filesystem writes. Status queries wait for queued
+writes and read the persisted receipt outside the policy receive loop; queue
+saturation or persistence errors keep the receipt incomplete. Runtime shutdown
+drains learner callbacks before closing the receipt writer. This isolation does
+not provide a deadline for shutdown when storage is stalled.
